@@ -1,0 +1,12 @@
+[package]
+name = "bitrust"
+version = "0.1.0"
+authors = ["Yati Sagade <mail@ysagade.nl>"]
+
+[dependencies]
+crc = "1.8.1"
+log = "^0.3.1"
+simple_logger = "^0.4"
+byteorder = "^1"
+bytes = "0.4"
+getopts = "0.2"
