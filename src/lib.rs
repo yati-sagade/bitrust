@@ -228,7 +228,6 @@ impl BitRust {
         payload.put(key_bytes);
         payload.put(val_bytes);
 
-
         let checksum = util::checksum_crc32(&payload);
 
         payload_head.put_u32_be(checksum);
@@ -269,7 +268,6 @@ impl BitRust {
                 &mut read_buf,
             )?;
             debug!("Read {} bytes", read_buf.len());
-
 
             // We use a BytesMut for the easy extractor methods for which
             // we'd otherwise have to use mem::transmute or something directly.
@@ -322,6 +320,7 @@ fn build_key_dir(dd_contents: DataDirContents) -> io::Result<KeyDir> {
                     file_id
                 )
             });
+            let data_file = File::open(&data_file)?;
             read_data_file_into_keydir(file_id, &data_file, &mut keydir)?;
         }
     }
@@ -418,11 +417,25 @@ where
 }
 
 
-fn read_data_file_into_keydir(
-    _file_id: FileID,
-    _data_file: &PathBuf,
-    _key_dir: &mut KeyDir,
-) -> io::Result<()> {
+fn read_data_file_into_keydir<R>(
+    file_id: FileID,
+    mut data_file: R,
+    key_dir: &mut KeyDir,
+) -> io::Result<()>
+where
+    R: Read,
+{
+    let mut offset = 0;
+    loop {
+        match read_data_file_record_into_keydir(file_id, &mut data_file, key_dir, offset)? {
+            Some(new_offset) => {
+                offset = new_offset;
+            }
+            None => {
+                break;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -430,8 +443,64 @@ fn read_data_file_record_into_keydir<R>(
     file_id: FileID,
     data_file: R,
     key_dir: &mut KeyDir,
-) -> io::Result<Option<()>> where R: Read {
-    Ok(Some(()))
+    offset: u64,
+) -> io::Result<Option<u64>>
+where
+    R: Read,
+{
+
+    let mut reader = data_file;
+    let mut new_offset = offset;
+
+    let checksum = {
+        let mut checksum_bytes = [0u8; 4];
+        let mut read_so_far = 0;
+        while read_so_far != 4 {
+            let read_bytes = reader.read(&mut checksum_bytes[read_so_far..])?;
+            if read_bytes == 0 {
+                if read_so_far == 0 {
+                    return Ok(None);
+                }
+                panic!(
+                    "Expected to read 4 bytes of checksum but could read only {}",
+                    read_so_far
+                );
+            } else {
+                read_so_far += read_bytes;
+            }
+        }
+        let mut checksum_slice = &checksum_bytes[..];
+        checksum_slice.read_u32::<BigEndian>()?
+    };
+    new_offset += 4;
+
+    let timestamp = reader.read_u64::<BigEndian>()?;
+    new_offset += 8;
+
+    let key_size = reader.read_u16::<BigEndian>()?;
+    new_offset += 2;
+
+    let val_size = reader.read_u16::<BigEndian>()?;
+    new_offset += 2;
+
+    let key = {
+        let mut key_bytes = vec![0u8; key_size as usize];
+        reader.read_exact(&mut key_bytes)?;
+        String::from_utf8(key_bytes).unwrap()
+    };
+    new_offset += key_size as u64;
+
+    {
+        let mut val_bytes = vec![0u8; val_size as usize];
+        // Don't actually need the value, to advance the pointer.
+        reader.read_exact(&mut val_bytes)?;
+    }
+    new_offset += val_size as u64;
+
+    let entry = KeyDirEntry::new(file_id, (new_offset - offset) as u16, offset, timestamp);
+    key_dir.insert(key, entry);
+
+    Ok(Some((new_offset)))
 }
 
 // Returns a HashMap from FileId to (DataFile, HintFile). HintFile can be absent
