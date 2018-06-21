@@ -35,6 +35,12 @@ fn main() -> io::Result<()> {
         } else if cmd[0] == "get" {
             let key = cmd[1];
             println!("{:?}", br.get(key));
+        } else if cmd[0] == "list_keys" {
+            for key in br.keys() {
+                println!("{}", key);
+            }
+        } else if cmd[0] == "exit" {
+            break;
         }
     }
     #[allow(unreachable_code)] Ok(())

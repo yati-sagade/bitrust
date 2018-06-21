@@ -299,6 +299,10 @@ impl BitRust {
             Ok(None)
         }
     }
+
+    pub fn keys(&self) -> Vec<String> {
+        self.keydir.entries.keys().cloned().collect()
+    }
 }
 
 fn build_key_dir(dd_contents: DataDirContents) -> io::Result<KeyDir> {
