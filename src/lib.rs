@@ -11,9 +11,9 @@ extern crate simple_logger;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::path::{PathBuf, Path};
-use std::io::{self, Cursor};
+use std::io::{self};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, BufReader, Write, Seek, SeekFrom};
+use std::io::{Read, Write, Seek, SeekFrom};
 
 use bytes::{BytesMut, BufMut, IntoBuf, Buf};
 use byteorder::{ReadBytesExt, BigEndian};
@@ -452,7 +452,7 @@ where
     let mut reader = data_file;
     let mut new_offset = offset;
 
-    let checksum = {
+    let _checksum = {
         let mut checksum_bytes = [0u8; 4];
         let mut read_so_far = 0;
         while read_so_far != 4 {
@@ -472,6 +472,7 @@ where
         let mut checksum_slice = &checksum_bytes[..];
         checksum_slice.read_u32::<BigEndian>()?
     };
+    // XXX: Check data integrity with the checksum
     new_offset += 4;
 
     let timestamp = reader.read_u64::<BigEndian>()?;
@@ -500,7 +501,7 @@ where
     let entry = KeyDirEntry::new(file_id, (new_offset - offset) as u16, offset, timestamp);
     key_dir.insert(key, entry);
 
-    Ok(Some((new_offset)))
+    Ok(Some(new_offset))
 }
 
 // Returns a HashMap from FileId to (DataFile, HintFile). HintFile can be absent
@@ -570,6 +571,7 @@ where
 #[cfg(test)]
 mod test {
     extern crate tempfile;
+    use std::io::Cursor;
     use super::*;
 
     #[test]
@@ -639,7 +641,7 @@ mod test {
             let fields = line.split(",").collect::<Vec<_>>();
 
             let timestamp = fields[0].parse::<u64>().unwrap();
-            let key_size = fields[1].parse::<u16>().unwrap();
+            let _key_size = fields[1].parse::<u16>().unwrap();
             let val_size = fields[2].parse::<u16>().unwrap();
             let offset = fields[3].parse::<u64>().unwrap();
             let key = fields[4];
