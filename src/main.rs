@@ -3,7 +3,7 @@ extern crate log;
 extern crate simple_logger;
 extern crate getopts;
 
-use std::io::{self};
+use std::io;
 use std::env;
 use std::path::Path;
 
@@ -13,7 +13,7 @@ use bitrust::BitRust;
 fn main() -> io::Result<()> {
     let matches = parse_opts();
 
-    let loglevel = matches.opt_str("l").unwrap_or(String::from("info"));
+    let loglevel = matches.opt_str("l").unwrap_or_else(|| String::from("info"));
 
     let loglevel = match loglevel.as_ref() {
         "info" => LogLevel::Info,
@@ -22,8 +22,7 @@ fn main() -> io::Result<()> {
         _ => panic!("Invalid loglevel"),
     };
 
-    simple_logger::init_with_level(loglevel)
-        .expect("Could not initialize logger");
+    simple_logger::init_with_level(loglevel).expect("Could not initialize logger");
     let mut br = BitRust::new(Path::new("/home/ys/data"))?;
     loop {
         let mut cmd = String::new();
@@ -38,8 +37,7 @@ fn main() -> io::Result<()> {
             println!("{:?}", br.get(key));
         }
     }
-    #[allow(unreachable_code)]
-    Ok(())
+    #[allow(unreachable_code)] Ok(())
 }
 
 fn parse_opts() -> getopts::Matches {

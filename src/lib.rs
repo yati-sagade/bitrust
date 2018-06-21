@@ -7,10 +7,11 @@ extern crate crc;
 extern crate log;
 extern crate simple_logger;
 
+
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::path::{PathBuf, Path};
-use std::io;
+use std::io::{self, Cursor};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, BufReader, Write, Seek, SeekFrom};
 
@@ -31,8 +32,8 @@ enum FileKind {
 // We'll just stick to the convention that *.data are datafiles, and *.hint
 // are hintfiles.
 impl FileKind {
-    fn from_path(path: &PathBuf) -> Option<FileKind> {
-        let ext = path.extension()?.to_str()?;
+    fn from_path<P: AsRef<Path>>(path: P) -> Option<FileKind> {
+        let ext = path.as_ref().extension()?.to_str()?;
         match ext {
             "data" => Some(FileKind::DataFile),
             "hint" => Some(FileKind::HintFile),
@@ -174,12 +175,16 @@ pub struct BitRust {
     active_file: ActiveFile,
 }
 
-impl BitRust {
-    pub fn new(data_dir: &Path) -> io::Result<BitRust> {
-        info!("Making a bitrust");
-        fs::create_dir_all(data_dir)?;
 
-        let data_dir = data_dir.to_path_buf();
+impl BitRust {
+    pub fn new<P>(data_dir: P) -> io::Result<BitRust>
+    where
+        P: AsRef<Path>,
+    {
+        info!("Making a bitrust");
+        fs::create_dir_all(data_dir.as_ref())?;
+
+        let data_dir = data_dir.as_ref().to_path_buf();
         let data_and_hint_files = get_data_and_hint_files(&data_dir)?;
         let keydir = build_key_dir(data_and_hint_files)?;
 
@@ -197,10 +202,10 @@ impl BitRust {
         let key_bytes = key.clone().into_bytes();
         let val_bytes = value.into_bytes();
 
-        let payload_size = 32                   // checksum
-                         + 64                   // timestamp
-                         + 16                   // key size
-                         + 16                   // value size
+        let payload_size = 4                    // checksum
+                         + 8                    // timestamp
+                         + 2                    // key size
+                         + 2                    // value size
                          + key_bytes.len()      // key payload
                          + val_bytes.len()      // value payload
                          ;
@@ -209,7 +214,7 @@ impl BitRust {
 
         // We split to after 32 bits so we can write the data first, and then
         // computer the checksum of this data to put in the initial 32 bits.
-        let mut payload_head = payload.split_to(32);
+        let mut payload_head = payload.split_to(4);
 
         let timestamp_now = {
             let dur_since_unix_epoch = SystemTime::now().duration_since(UNIX_EPOCH).expect(
@@ -308,6 +313,7 @@ fn build_key_dir(dd_contents: DataDirContents) -> io::Result<KeyDir> {
 
     for (file_id, (data_file, hint_file)) in dd_entries {
         if let Some(hint_file) = hint_file {
+            let hint_file = File::open(&hint_file)?;
             read_hint_file_into_keydir(file_id, &hint_file, &mut keydir)?;
         } else {
             let data_file = data_file.unwrap_or_else(|| {
@@ -322,18 +328,77 @@ fn build_key_dir(dd_contents: DataDirContents) -> io::Result<KeyDir> {
     Ok(keydir)
 }
 
-fn read_hint_file_into_keydir(
+fn read_hint_file_into_keydir<R>(
     file_id: FileID,
-    hint_file: &PathBuf,
+    mut hint_file: R,
     key_dir: &mut KeyDir,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    R: Read,
+{
+    loop {
+        match read_hint_file_record(file_id, &mut hint_file, key_dir)? {
+            Some(_) => {}
+            None => {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
 
-    let err_prefix = format!("When reading hint file {:?}", hint_file);
-    info!("Reading hint file {:?}", hint_file);
-    let mut reader = BufReader::new(File::open(hint_file)?);
+
+// Return an Err(_) when an io error happens
+//
+// Return an Ok(Some(())) when we did not hit EOF when trying to read a record
+// (i.e., more might come)
+//
+// Return an Ok(None) when we encountered an EOF when reading the first 8
+// bytes of the record (means end of stream).
+//
+// There is a possibility that we read a part of the 8 bytes that we wanted to
+// read, and that might indicate a subtle corruption. We handle that by reading
+// the first field slightly more laboriously.
+
+fn read_hint_file_record<R>(
+    file_id: FileID,
+    hint_file: R,
+    key_dir: &mut KeyDir,
+) -> io::Result<Option<()>>
+where
+    R: Read,
+{
+
+    // XXX: Somehow using BufReader here does not work, investigate.
+    let mut reader = hint_file;
 
     // | tstamp (64) | ksz (16) | record_size (16) | record_offset (32) | key ($ksz) |
-    let timestamp = reader.read_u64::<BigEndian>()?;
+
+    // To signal end of stream, we try to read the first field, the timestamp,
+    // and return None if we cannot read anything. However, if we can read a
+    // part of that field, it could indicate a subtle corruption, so we panic.
+
+    let timestamp = {
+        let mut timestamp_bytes = [0u8; 8];
+        let mut read_so_far = 0;
+        while read_so_far != 8 {
+            let read_bytes = reader.read(&mut timestamp_bytes[read_so_far..])?;
+            if read_bytes == 0 {
+                if read_so_far == 0 {
+                    return Ok(None);
+                }
+                panic!(
+                    "Expected to read 8 bytes but could read only {}",
+                    read_so_far
+                );
+            } else {
+                read_so_far += read_bytes;
+            }
+        }
+        let mut timestamp_slice = &timestamp_bytes[..];
+        timestamp_slice.read_u64::<BigEndian>()?
+    };
+
     let key_size = reader.read_u16::<BigEndian>()?;
     let val_size = reader.read_u16::<BigEndian>()?;
     let val_pos = reader.read_u64::<BigEndian>()?;
@@ -342,17 +407,14 @@ fn read_hint_file_into_keydir(
         let mut key_bytes = vec![0u8; key_size as usize];
         reader.read_exact(&mut key_bytes)?;
         String::from_utf8(key_bytes.clone()).unwrap_or_else(|_| {
-            panic!(
-                "{}: Could not read key as utf8. Bytes={:?}",
-                err_prefix,
-                key_bytes
-            )
+            panic!("Could not read key as utf8. Bytes={:?}", key_bytes)
         })
     };
 
     let entry = KeyDirEntry::new(file_id, val_size, val_pos, timestamp);
     key_dir.insert(key, entry);
-    Ok(())
+
+    Ok(Some(()))
 }
 
 
@@ -364,10 +426,21 @@ fn read_data_file_into_keydir(
     Ok(())
 }
 
+fn read_data_file_record_into_keydir<R>(
+    file_id: FileID,
+    data_file: R,
+    key_dir: &mut KeyDir,
+) -> io::Result<Option<()>> where R: Read {
+    Ok(Some(()))
+}
+
 // Returns a HashMap from FileId to (DataFile, HintFile). HintFile can be absent
 // when a DataFile is there, but the reverse should never happen, and this
 // function panics in that case.
-fn get_data_and_hint_files(data_dir: &PathBuf) -> io::Result<DataDirContents> {
+fn get_data_and_hint_files<P>(data_dir: P) -> io::Result<DataDirContents>
+where
+    P: AsRef<Path>,
+{
     let mut retmap = DataDirContents::new();
     for entry in fs::read_dir(data_dir)? {
         let file_path = entry.expect("Error reading data directory").path();
@@ -407,7 +480,11 @@ fn get_data_and_hint_files(data_dir: &PathBuf) -> io::Result<DataDirContents> {
     Ok(retmap)
 }
 
-fn file_id_from_path(path: &PathBuf) -> u16 {
+fn file_id_from_path<P>(path: P) -> u16
+where
+    P: AsRef<Path>,
+{
+    let path = path.as_ref();
     path.file_stem()
         .unwrap_or_else(|| panic!("Could not get stem path for {:?}", path))
         .to_str()
@@ -419,4 +496,102 @@ fn file_id_from_path(path: &PathBuf) -> u16 {
                 path
             )
         })
+}
+
+#[cfg(test)]
+mod test {
+    extern crate tempfile;
+    use super::*;
+
+    #[test]
+    fn test_file_id_from_path() {
+        let path = PathBuf::from("/some/path/to/42.data");
+        let file_id = file_id_from_path(&path);
+        assert!(file_id == 42);
+
+        let path = PathBuf::from("/some/path/to/42.hint");
+        let file_id = file_id_from_path(&path);
+        assert!(file_id == 42);
+    }
+
+    #[test]
+    fn test_get_data_and_hint_files() {
+        let data_dir = tempfile::tempdir().unwrap();
+        for idx in 0..10 {
+            let data_file_path = data_dir.path().join(&format!("{}.data", idx));
+            let _f = File::create(&data_file_path).unwrap();
+            if idx < 5 {
+                let hint_file_path = data_dir.path().join(&format!("{}.hint", idx));
+                let _f = File::create(&hint_file_path).unwrap();
+            }
+            let spurious_file_path = data_dir.path().join(&format!("{}.spurious", idx));
+            let _f = File::create(&spurious_file_path).unwrap();
+        }
+        let spurious_file_path = data_dir.path().join("10.spurious");
+        let _f = File::create(&spurious_file_path).unwrap();
+
+        let mut dd_contents = get_data_and_hint_files(data_dir.path()).unwrap();
+
+        for idx in 0..10 {
+            let (data_file, hint_file) = dd_contents.remove(&idx).unwrap_or_else(|| {
+                panic!("Missing file_id {}", idx);
+            });
+            let data_file = data_file.unwrap_or_else(|| panic!("data file {} not found", idx));
+
+            assert!(data_file == data_dir.path().join(&format!("{}.data", idx)));
+
+            if idx < 5 {
+                let hint_file = hint_file.unwrap_or_else(|| panic!("hint file {} not found", idx));
+                assert!(hint_file == data_dir.path().join(&format!("{}.hint", idx)));
+            }
+        }
+        assert!(dd_contents.len() == 0);
+    }
+
+    #[test]
+    fn test_read_hintfile_into_keydir() {
+
+        let hintfile_bytes = include_bytes!("../aux/test_hintfile.hint");
+        let hint_bytes = Vec::from(&hintfile_bytes[..]);
+        let hintfile_mock = Cursor::new(hint_bytes);
+        let mut keydir = KeyDir::new();
+
+        read_hint_file_into_keydir(0, hintfile_mock, &mut keydir).unwrap();
+
+        let hintfile_guide_str = include_str!("../aux/test_hintfile.hint.guide");
+
+        let hintfile_guide_lines = hintfile_guide_str
+            .split("\n")
+            .filter(|line| line.len() > 0)
+            .collect::<Vec<_>>();
+
+        for line in hintfile_guide_lines {
+            let line = line.trim();
+            let fields = line.split(",").collect::<Vec<_>>();
+
+            let timestamp = fields[0].parse::<u64>().unwrap();
+            let key_size = fields[1].parse::<u16>().unwrap();
+            let val_size = fields[2].parse::<u16>().unwrap();
+            let offset = fields[3].parse::<u64>().unwrap();
+            let key = fields[4];
+
+            let entry = keydir.entries.remove(key).unwrap();
+
+            assert!(entry.file_id == 0);
+            assert!(entry.record_size == val_size);
+            assert!(entry.record_offset == offset);
+            assert!(entry.timestamp == timestamp);
+        }
+        assert!(keydir.entries.len() == 0);
+    }
+
+    #[test]
+    fn test_fn() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut br = BitRust::new(data_dir.path()).unwrap();
+
+        br.put("foo".to_string(), "bar".to_string()).unwrap();
+        let r = br.get("foo").unwrap().unwrap();
+        assert!(r == "bar");
+    }
 }
