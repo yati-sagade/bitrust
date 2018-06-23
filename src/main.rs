@@ -1,31 +1,52 @@
 extern crate bitrust;
+#[macro_use]
 extern crate log;
 extern crate simple_logger;
 extern crate getopts;
+extern crate ctrlc;
 
-use std::io;
+use std::io::{self, Write};
 use std::env;
-use std::path::Path;
+use std::process;
+use std::path::PathBuf;
 
 use log::LogLevel;
 use bitrust::BitRust;
 
 fn main() -> io::Result<()> {
     let matches = parse_opts();
-
-    let loglevel = matches.opt_str("l").unwrap_or_else(|| String::from("info"));
-
-    let loglevel = match loglevel.as_ref() {
-        "info" => LogLevel::Info,
-        "debug" => LogLevel::Debug,
-        "warn" => LogLevel::Warn,
-        _ => panic!("Invalid loglevel"),
+    setup_logging(loglevel(&matches));
+    let data_dir = datadir(&matches);
+    info!("data_dir: {:?}", &data_dir);
+    let mut br = match BitRust::new(&data_dir) {
+        Ok(br) => br,
+        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+            eprintln!("Lock file {:?} exists, and is already held by pid {}",
+                        data_dir.join(".lock"), 0);
+            process::exit(1);
+        }
+        Err(e) => { return Err(e); }
     };
 
-    simple_logger::init_with_level(loglevel).expect("Could not initialize logger");
-    let mut br = BitRust::new(Path::new("/home/ys/data"))?;
+    cmd_loop(&mut br)
+}
+
+fn prompt() -> io::Result<()> {
+    print!("> ");
+    io::stdout().flush()?;
+    Ok(())
+}
+
+fn cmd_loop(br: &mut BitRust) -> io::Result<()> {
+
+    ctrlc::set_handler(move || {
+        println!("Type exit to quit");
+        prompt().unwrap();
+    }).expect("Error setting handler");
+
     loop {
         let mut cmd = String::new();
+        prompt()?;
         io::stdin().read_line(&mut cmd)?;
         let cmd = cmd.trim().split_whitespace().collect::<Vec<_>>();
         if cmd[0] == "put" {
@@ -39,16 +60,43 @@ fn main() -> io::Result<()> {
             for key in br.keys() {
                 println!("{}", key);
             }
-        } else if cmd[0] == "exit" {
+        } else if cmd[0] == "exit" || cmd[0] == "quit" {
             break;
         }
     }
+    info!("Exit");
     #[allow(unreachable_code)] Ok(())
+}
+
+fn loglevel(matches: &getopts::Matches) -> LogLevel {
+    let loglevel = matches.opt_str("l").unwrap_or_else(|| String::from("info"));
+    match loglevel.as_ref() {
+        "info" => LogLevel::Info,
+        "debug" => LogLevel::Debug,
+        "warn" => LogLevel::Warn,
+        _ => panic!("Invalid loglevel"),
+    }
+}
+
+fn datadir(matches: &getopts::Matches) -> PathBuf {
+    matches
+    .opt_str("d")
+    .map(Into::into) // convert to PathBuf
+    .unwrap_or_else(|| {
+        env::home_dir()
+              .expect("Could not resolve $HOME, please provide -d")
+              .join("bitrust_data")
+    })
+}
+
+fn setup_logging(loglevel: LogLevel) {
+    simple_logger::init_with_level(loglevel).expect("Could not initialize logger");
 }
 
 fn parse_opts() -> getopts::Matches {
     let args: Vec<String> = env::args().collect();
     let mut opts = getopts::Options::new();
     opts.optopt("l", "loglevel", "Log level", "LEVEL");
+    opts.optopt("d", "datadir", "Data directory", "DATADIR");
     opts.parse(&args[1..]).expect("Error parsing options")
 }

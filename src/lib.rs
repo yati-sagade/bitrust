@@ -1,5 +1,3 @@
-pub mod util;
-
 extern crate byteorder;
 extern crate bytes;
 extern crate crc;
@@ -7,6 +5,8 @@ extern crate crc;
 extern crate log;
 extern crate simple_logger;
 
+mod util;
+mod lockfile;
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,6 +14,7 @@ use std::path::{PathBuf, Path};
 use std::io::{self};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write, Seek, SeekFrom};
+use std::process;
 use std::mem;
 
 use bytes::{BytesMut, BufMut, IntoBuf, Buf};
@@ -174,8 +175,8 @@ pub struct BitRust {
     keydir: KeyDir,
     data_dir: PathBuf,
     active_file: ActiveFile,
+    lockfile: lockfile::LockFile,
 }
-
 
 impl BitRust {
     pub fn new<P>(data_dir: P) -> io::Result<BitRust>
@@ -186,6 +187,10 @@ impl BitRust {
         fs::create_dir_all(data_dir.as_ref())?;
 
         let data_dir = data_dir.as_ref().to_path_buf();
+        let lockfile_path = data_dir.join(".lock");
+
+        let lockfile = get_process_lockfile(lockfile_path)?;
+
         let data_and_hint_files = get_data_and_hint_files(&data_dir)?;
         let keydir = build_key_dir(data_and_hint_files)?;
 
@@ -193,9 +198,8 @@ impl BitRust {
             keydir,
             data_dir: data_dir.to_path_buf(),
             active_file: ActiveFile::new(data_dir.join("0.data"))?,
+            lockfile,
         };
-
-        println!("{:?}", &bitrust.keydir);
 
         Ok(bitrust)
     }
@@ -521,6 +525,15 @@ where
     let mut retmap = DataDirContents::new();
     for entry in fs::read_dir(data_dir)? {
         let file_path = entry.expect("Error reading data directory").path();
+        if file_path
+            .file_stem()
+            .unwrap_or_else(|| panic!("Could not fild stemp for {:?}", &file_path))
+            .to_str()
+            .unwrap()
+            .starts_with(".")
+        {
+            continue;
+        }
         let file_id = file_id_from_path(&file_path);
         match FileKind::from_path(&file_path) {
             // XXX: both arms are almost identical except for which element
@@ -573,6 +586,13 @@ where
                 path
             )
         })
+}
+
+fn get_process_lockfile<P>(path: P) -> io::Result<lockfile::LockFile>
+    where P: AsRef<Path>
+{
+    let our_pid_str = process::id().to_string();
+    lockfile::LockFile::new(path, Some(our_pid_str.as_bytes()))
 }
 
 #[cfg(test)]
@@ -705,12 +725,24 @@ mod test {
     }
 
     #[test]
-    fn test_fn() {
+    fn test_creation() {
         let data_dir = tempfile::tempdir().unwrap();
         let mut br = BitRust::new(data_dir.path()).unwrap();
 
         br.put("foo".to_string(), "bar".to_string()).unwrap();
         let r = br.get("foo").unwrap().unwrap();
         assert!(r == "bar");
+    }
+
+    #[test]
+    fn test_locking_of_data_dir() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let _br = BitRust::new(data_dir.path()).unwrap();
+
+        let another_br = BitRust::new(data_dir.path());
+        assert!(another_br.is_err());
+        if let Err(e) = another_br {
+            assert!(e.kind() == io::ErrorKind::AlreadyExists);
+        }
     }
 }

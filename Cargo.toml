@@ -13,3 +13,5 @@ getopts = "0.2"
 tempfile = "3"
 proptest = "0.7.2"
 rand = "0.3"
+fs2 = "0.4.3"
+ctrlc = { version = "3.0", features = [ "termination" ] }

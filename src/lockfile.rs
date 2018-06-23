@@ -1,12 +1,8 @@
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::io::{self, Write};
 use std::fs;
-
-#[macro_use]
-use log;
-
 
 #[derive(Debug)]
 pub struct LockFile {
