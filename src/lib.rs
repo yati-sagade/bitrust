@@ -189,9 +189,24 @@ impl BitRust {
         let data_dir = data_dir.as_ref().to_path_buf();
         let lockfile_path = data_dir.join(".lock");
 
+        // If the following fails, all it means is that we have a file at our
+        // lockfile location that we did not create. We don't care at this
+        // point why it exists, and just bail out.
+        //
+        // This lock will be released (and the lockfile removed) when the
+        // returned object goes out of scope. Since we move it into the
+        // returned BitRust, this means the lock lives as long as the returned
+        // BitRust lives.
         let lockfile = get_process_lockfile(lockfile_path)?;
 
+        // Get the names of the data and hint files. Because these are named
+        // like ${file_id}.data and ${file_id}.hint respectively, we can group
+        // together the data and hint files for a given file_id together. A
+        // hint file is optional, but cannot exist without a corresponding data
+        // file (because hint files just contain pointers into the respective
+        // data files)
         let data_and_hint_files = get_data_and_hint_files(&data_dir)?;
+
         let keydir = build_key_dir(data_and_hint_files)?;
 
         let bitrust = BitRust {
@@ -315,12 +330,17 @@ impl BitRust {
 fn build_key_dir(dd_contents: DataDirContents) -> io::Result<KeyDir> {
     info!("Making keydir");
 
+    // First sort the data and hint files by file_id ascending so we process
+    // the oldest entries first so in the end we have the latest persisted
+    // values in the keydir.
     let mut dd_entries = dd_contents.into_iter().collect::<Vec<_>>();
     dd_entries.sort_by(|v1, v2| v1.0.cmp(&v2.0));
 
     let mut keydir = KeyDir::new();
 
     for (file_id, (data_file, hint_file)) in dd_entries {
+        // If we have the hint file, we prefer reading it since it is almost
+        // a direct on-disk representation of the keydir.
         if let Some(hint_file) = hint_file {
             let hint_file = File::open(&hint_file)?;
             read_hint_file_into_keydir(file_id, &hint_file, &mut keydir)?;
@@ -348,6 +368,7 @@ where
 {
     loop {
         match read_hint_file_record(file_id, &mut hint_file, key_dir)? {
+            // We receive a Some(_) when EOF hasn't been reached.
             Some(_) => {}
             None => {
                 break;
@@ -369,7 +390,6 @@ where
 // There is a possibility that we read a part of the 8 bytes that we wanted to
 // read, and that might indicate a subtle corruption. We handle that by reading
 // the first field slightly more laboriously.
-
 fn read_hint_file_record<R>(
     file_id: FileID,
     hint_file: R,
@@ -382,6 +402,7 @@ where
     // XXX: Somehow using BufReader here does not work, investigate.
     let mut reader = hint_file;
 
+    // Record format
     // | tstamp (64) | ksz (16) | record_size (16) | record_offset (32) | key ($ksz) |
 
     // To signal end of stream, we try to read the first field, the timestamp,
@@ -462,6 +483,15 @@ where
 
     let mut reader = data_file;
     let mut new_offset = offset;
+
+    // Record format (top-to-bottom contiguous sequence of bytes)
+    //
+    // | checksum (4 bytes)      |
+    // | tstamp   (8 bytes)      |
+    // | ksz      (2 bytes)      |
+    // | valsz    (2 bytes)      |
+    // | key      ($ksz bytes)   |
+    // | val      ($valsz bytes) |
 
     let checksum = {
         let mut checksum_bytes = [0u8; 4];
