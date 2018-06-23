@@ -14,6 +14,7 @@ use std::path::{PathBuf, Path};
 use std::io::{self};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write, Seek, SeekFrom};
+use std::mem;
 
 use bytes::{BytesMut, BufMut, IntoBuf, Buf};
 use byteorder::{ReadBytesExt, BigEndian};
@@ -204,12 +205,12 @@ impl BitRust {
         let key_bytes = key.clone().into_bytes();
         let val_bytes = value.into_bytes();
 
-        let payload_size = 4                    // checksum
-                         + 8                    // timestamp
-                         + 2                    // key size
-                         + 2                    // value size
-                         + key_bytes.len()      // key payload
-                         + val_bytes.len()      // value payload
+        let payload_size = mem::size_of::<u32>()  // checksum
+                         + mem::size_of::<u64>()  // timestamp
+                         + mem::size_of::<u16>()  // key size
+                         + mem::size_of::<u16>()  // value size
+                         + key_bytes.len()        // key payload
+                         + val_bytes.len()        // value payload
                          ;
 
         let mut payload = BytesMut::with_capacity(payload_size);
@@ -458,7 +459,7 @@ where
     let mut reader = data_file;
     let mut new_offset = offset;
 
-    let _checksum = {
+    let checksum = {
         let mut checksum_bytes = [0u8; 4];
         let mut read_so_far = 0;
         while read_so_far != 4 {
@@ -479,16 +480,16 @@ where
         checksum_slice.read_u32::<BigEndian>()?
     };
     // XXX: Check data integrity with the checksum
-    new_offset += 4;
+    new_offset += util::sizeof_val(&checksum) as u64;
 
     let timestamp = reader.read_u64::<BigEndian>()?;
-    new_offset += 8;
+    new_offset += util::sizeof_val(&timestamp) as u64;
 
     let key_size = reader.read_u16::<BigEndian>()?;
-    new_offset += 2;
+    new_offset += util::sizeof_val(&key_size) as u64;
 
     let val_size = reader.read_u16::<BigEndian>()?;
-    new_offset += 2;
+    new_offset += util::sizeof_val(&val_size) as u64;
 
     let key = {
         let mut key_bytes = vec![0u8; key_size as usize];
