@@ -194,6 +194,8 @@ impl BitRust {
             active_file: ActiveFile::new(data_dir.join("0.data"))?,
         };
 
+        println!("{:?}", &bitrust.keydir);
+
         Ok(bitrust)
     }
 
@@ -623,22 +625,26 @@ mod test {
         assert!(dd_contents.len() == 0);
     }
 
+
+    // The following two tests statically include reference data from ../aux,
+    // along with "guide" files, which tell us what to expect once the binary
+    // data/hint files are loaded.
+
     #[test]
     fn test_read_hintfile_into_keydir() {
 
-        let hintfile_bytes = include_bytes!("../aux/test_hintfile.hint");
-        let hint_bytes = Vec::from(&hintfile_bytes[..]);
-        let hintfile_mock = Cursor::new(hint_bytes);
+        let hint_bytes = Vec::from(&include_bytes!("../aux/test_hintfile.hint")[..]);
+        let hintfile_reader = Cursor::new(hint_bytes);
         let mut keydir = KeyDir::new();
 
-        read_hint_file_into_keydir(0, hintfile_mock, &mut keydir).unwrap();
+        read_hint_file_into_keydir(0, hintfile_reader, &mut keydir).unwrap();
 
         let hintfile_guide_str = include_str!("../aux/test_hintfile.hint.guide");
 
         let hintfile_guide_lines = hintfile_guide_str
-            .split("\n")
-            .filter(|line| line.len() > 0)
-            .collect::<Vec<_>>();
+                                    .split("\n")
+                                    .filter(|line| line.len() > 0)
+                                    .collect::<Vec<_>>();
 
         for line in hintfile_guide_lines {
             let line = line.trim();
@@ -658,6 +664,43 @@ mod test {
             assert!(entry.timestamp == timestamp);
         }
         assert!(keydir.entries.len() == 0);
+    }
+
+    #[test]
+    fn test_read_datafile_into_keydir() {
+
+        let data_bytes = Vec::from(&include_bytes!("../aux/test_datafile.data")[..]);
+        let datafile_reader = Cursor::new(data_bytes);
+        let mut keydir = KeyDir::new();
+
+        read_data_file_into_keydir(0, datafile_reader, &mut keydir).unwrap();
+
+        let datafile_guide_str = include_str!("../aux/test_datafile.data.guide");
+        let datafile_guide_lines = datafile_guide_str   
+                                    .split("\n")
+                                    .filter(|line| line.len() > 0)
+                                    .collect::<Vec<_>>();
+                    
+        for line in datafile_guide_lines {
+            let line = line.trim();
+            let fields = line.split(",").collect::<Vec<_>>();
+
+            let key = fields[0];
+            let file_id = fields[1].parse::<FileID>().unwrap();
+            let record_size = fields[2].parse::<u16>().unwrap();
+            let record_offset = fields[3].parse::<u64>().unwrap();
+            let timestamp = fields[4].parse::<u64>().unwrap();
+
+            let entry = keydir.entries.remove(key).unwrap();
+
+            assert!(file_id == 0);
+            assert!(entry.file_id == file_id);
+            assert!(entry.record_size == record_size);
+            assert!(entry.record_offset == record_offset);
+            assert!(entry.timestamp == timestamp);
+        }
+        assert!(keydir.entries.len() == 0);
+
     }
 
     #[test]
