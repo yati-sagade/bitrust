@@ -24,7 +24,7 @@ fn test_model_based_load_store() {
         br.put(key.clone(), val).unwrap();
         assert!(&br.get(&key).unwrap().unwrap() == model.get(&key).unwrap());
     }
-    
+
     for (key, val) in model {
         assert!(br.get(&key).unwrap().unwrap() == val);
     }

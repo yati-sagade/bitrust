@@ -11,7 +11,8 @@ pub struct LockFile {
 
 impl LockFile {
     pub fn new<P>(path: P, lockfile_contents: Option<&[u8]>) -> io::Result<LockFile>
-        where P: AsRef<Path>
+    where
+        P: AsRef<Path>,
     {
 
         {
@@ -19,15 +20,18 @@ impl LockFile {
             // underlying open() syscall on *nix (and CREATE_NEW to the
             // CreateFileW Windows API), which means that the call is successful
             // only if it is the one which created the file.
-            let mut file = OpenOptions::new().write(true)
-                                             .create_new(true)
-                                             .open(path.as_ref())?;
+            let mut file = OpenOptions::new().write(true).create_new(true).open(
+                path.as_ref(),
+            )?;
             if let Some(contents) = lockfile_contents {
                 file.write_all(contents)?;
             }
         }
-        debug!("Successfully wrote lockfile {:?}, pid: {}",
-               path.as_ref(), process::id());
+        debug!(
+            "Successfully wrote lockfile {:?}, pid: {}",
+            path.as_ref(),
+            process::id()
+        );
         // By this time the file we created is closed, and we are sure that
         // we are the one who created it.
         Ok(LockFile { path: path.as_ref().to_path_buf() })
@@ -40,4 +44,3 @@ impl Drop for LockFile {
         fs::remove_file(&self.path).unwrap();
     }
 }
-

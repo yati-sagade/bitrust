@@ -21,11 +21,16 @@ fn main() -> io::Result<()> {
     let mut br = match BitRust::new(&data_dir) {
         Ok(br) => br,
         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-            eprintln!("Lock file {:?} exists, and is already held by pid {}",
-                        data_dir.join(".lock"), 0);
+            eprintln!(
+                "Lock file {:?} exists, and is already held by pid {}",
+                data_dir.join(".lock"),
+                0
+            );
             process::exit(1);
         }
-        Err(e) => { return Err(e); }
+        Err(e) => {
+            return Err(e);
+        }
     };
 
     cmd_loop(&mut br)

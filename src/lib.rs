@@ -11,7 +11,7 @@ mod lockfile;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::path::{PathBuf, Path};
-use std::io::{self};
+use std::io;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write, Seek, SeekFrom};
 use std::process;
@@ -589,7 +589,8 @@ where
 }
 
 fn get_process_lockfile<P>(path: P) -> io::Result<lockfile::LockFile>
-    where P: AsRef<Path>
+where
+    P: AsRef<Path>,
 {
     let our_pid_str = process::id().to_string();
     lockfile::LockFile::new(path, Some(our_pid_str.as_bytes()))
@@ -663,9 +664,9 @@ mod test {
         let hintfile_guide_str = include_str!("../aux/test_hintfile.hint.guide");
 
         let hintfile_guide_lines = hintfile_guide_str
-                                    .split("\n")
-                                    .filter(|line| line.len() > 0)
-                                    .collect::<Vec<_>>();
+            .split("\n")
+            .filter(|line| line.len() > 0)
+            .collect::<Vec<_>>();
 
         for line in hintfile_guide_lines {
             let line = line.trim();
@@ -697,11 +698,11 @@ mod test {
         read_data_file_into_keydir(0, datafile_reader, &mut keydir).unwrap();
 
         let datafile_guide_str = include_str!("../aux/test_datafile.data.guide");
-        let datafile_guide_lines = datafile_guide_str   
-                                    .split("\n")
-                                    .filter(|line| line.len() > 0)
-                                    .collect::<Vec<_>>();
-                    
+        let datafile_guide_lines = datafile_guide_str
+            .split("\n")
+            .filter(|line| line.len() > 0)
+            .collect::<Vec<_>>();
+
         for line in datafile_guide_lines {
             let line = line.trim();
             let fields = line.split(",").collect::<Vec<_>>();
