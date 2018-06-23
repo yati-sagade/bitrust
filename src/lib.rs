@@ -366,15 +366,8 @@ fn read_hint_file_into_keydir<R>(
 where
     R: Read,
 {
-    loop {
-        match read_hint_file_record(file_id, &mut hint_file, key_dir)? {
-            // We receive a Some(_) when EOF hasn't been reached.
-            Some(_) => {}
-            None => {
-                break;
-            }
-        }
-    }
+    // We receive a Some(_) when EOF hasn't been reached.
+    while let Some(_) = read_hint_file_record(file_id, &mut hint_file, key_dir)? {}
     Ok(())
 }
 
@@ -458,15 +451,14 @@ where
     R: Read,
 {
     let mut offset = 0;
-    loop {
-        match read_data_file_record_into_keydir(file_id, &mut data_file, key_dir, offset)? {
-            Some(new_offset) => {
-                offset = new_offset;
-            }
-            None => {
-                break;
-            }
-        }
+    while let Some(new_offset) = read_data_file_record_into_keydir(
+        file_id,
+        &mut data_file,
+        key_dir,
+        offset,
+    )?
+    {
+        offset = new_offset;
     }
     Ok(())
 }
@@ -530,14 +522,14 @@ where
         reader.read_exact(&mut key_bytes)?;
         String::from_utf8(key_bytes).unwrap()
     };
-    new_offset += key_size as u64;
+    new_offset += u64::from(key_size);
 
     {
         let mut val_bytes = vec![0u8; val_size as usize];
         // Don't actually need the value, to advance the pointer.
         reader.read_exact(&mut val_bytes)?;
     }
-    new_offset += val_size as u64;
+    new_offset += u64::from(val_size);
 
     let entry = KeyDirEntry::new(file_id, (new_offset - offset) as u16, offset, timestamp);
     key_dir.insert(key, entry);
@@ -555,15 +547,17 @@ where
     let mut retmap = DataDirContents::new();
     for entry in fs::read_dir(data_dir)? {
         let file_path = entry.expect("Error reading data directory").path();
-        if file_path
+
+        let file_basename = file_path
             .file_stem()
             .unwrap_or_else(|| panic!("Could not fild stemp for {:?}", &file_path))
             .to_str()
-            .unwrap()
-            .starts_with(".")
-        {
+            .unwrap();
+
+        if file_basename.starts_with('.') {
             continue;
         }
+
         let file_id = file_id_from_path(&file_path);
         match FileKind::from_path(&file_path) {
             // XXX: both arms are almost identical except for which element
