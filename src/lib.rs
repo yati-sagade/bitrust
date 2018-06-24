@@ -47,6 +47,8 @@ impl FileKind {
 type FileID = u16;
 type FileMap = HashMap<FileID, PathBuf>;
 
+pub const BITRUST_TOMBSTONE_STR: &'static str = "<bitrust_tombstone>";
+
 // The datadir is a folder on the filesystem where we store our datafiles and
 // hintfiles. This data structure maps a given file id to a tuple that contains
 // the path to the corresponding active file and the hint file, respectively.
@@ -316,10 +318,21 @@ impl BitRust {
 
             // At this point, all we have in buf is the value bytes
             let val = String::from_utf8(Buf::bytes(&buf).to_vec()).unwrap();
-            Ok(Some(val))
+
+            // Currently deletion and the application writing the tombstone
+            // value directly are indistinguishable.
+            if val.as_str() == BITRUST_TOMBSTONE_STR {
+                Ok(None)
+            } else {
+                Ok(Some(val))
+            }
         } else {
             Ok(None)
         }
+    }
+
+    pub fn delete(&mut self, key: &str) -> io::Result<()> {
+        self.put(key.to_string(), String::from(BITRUST_TOMBSTONE_STR))
     }
 
     pub fn keys(&self) -> Vec<String> {
@@ -769,5 +782,17 @@ mod test {
         if let Err(e) = another_br {
             assert!(e.kind() == io::ErrorKind::AlreadyExists);
         }
+    }
+
+    #[test]
+    fn test_deletion() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut br = BitRust::new(data_dir.path()).unwrap();
+
+        br.put("foo".to_string(), "bar".to_string()).unwrap();
+        assert!(br.get("foo").unwrap().unwrap() == "bar");
+
+        br.delete("foo").unwrap();
+        assert!(br.get("foo").unwrap().is_none());
     }
 }
