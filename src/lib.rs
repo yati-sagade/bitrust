@@ -129,8 +129,8 @@ impl KeyDir {
 // we can seek freely.
 #[derive(Debug)]
 struct ActiveFile {
-    pub write_handle: File,
-    pub read_handle: File,
+    write_handle: File,
+    read_handle: File,
     pub name: PathBuf,
     pub id: FileID,
 }
@@ -138,21 +138,28 @@ struct ActiveFile {
 impl ActiveFile {
     fn new(path: PathBuf) -> io::Result<ActiveFile> {
 
-        let write_handle = OpenOptions::new()
+        let mut write_handle = OpenOptions::new()
             .read(true)
             .append(true)
             .create(true)
             .open(&path)?;
 
+        let size_in_bytes = write_handle.seek(SeekFrom::End(0))? as usize;
+
         let read_handle = OpenOptions::new().read(true).create(false).open(&path)?;
 
         let file_id = file_id_from_path(&path);
-        Ok(ActiveFile {
+
+        let active_file = ActiveFile {
             write_handle,
             read_handle,
             name: path,
             id: file_id,
-        })
+        };
+
+        debug!("Initialized active file (size: {} bytes)", size_in_bytes);
+
+        Ok(active_file)
     }
 
     pub fn read_exact(&mut self, offset_from_start: u64, bytes: &mut [u8]) -> io::Result<()> {
@@ -270,6 +277,11 @@ impl BitRust {
                 record_offset,
                 timestamp_now,
             ),
+        );
+
+        debug!(
+            "After this write, active file is {} bytes",
+            self.active_file.tell()?
         );
 
         Ok(())
