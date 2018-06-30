@@ -1,23 +1,24 @@
 extern crate bitrust;
 #[macro_use]
 extern crate log;
-extern crate simple_logger;
+extern crate simplelog;
 extern crate getopts;
 extern crate ctrlc;
 
 use std::io::{self, Write};
 use std::env;
 use std::process;
-use std::path::PathBuf;
+use std::path::{PathBuf, Path};
+use std::fs::OpenOptions;
 
-use log::LogLevel;
+use simplelog::{CombinedLogger, TermLogger, WriteLogger, LevelFilter};
 use bitrust::{BitRust, ConfigBuilder, Config};
 
 fn main() -> io::Result<()> {
     let matches = parse_opts();
-    setup_logging(loglevel(&matches));
     let config = build_config(&matches);
     let datadir = config.datadir().to_path_buf();
+    setup_logging(&datadir, log_level_filter(&matches));
     let mut br = match BitRust::open(config) {
         Ok(br) => br,
         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -127,12 +128,14 @@ fn cmd_loop(br: &mut BitRust) -> io::Result<()> {
     #[allow(unreachable_code)] Ok(())
 }
 
-fn loglevel(matches: &getopts::Matches) -> LogLevel {
+fn log_level_filter(matches: &getopts::Matches) -> LevelFilter {
     let loglevel = matches.opt_str("l").unwrap_or_else(|| String::from("info"));
     match loglevel.as_ref() {
-        "info" => LogLevel::Info,
-        "debug" => LogLevel::Debug,
-        "warn" => LogLevel::Warn,
+        "info" => LevelFilter::Info,
+        "debug" => LevelFilter::Debug,
+        "warn" => LevelFilter::Warn,
+        "error" => LevelFilter::Error,
+        "trace" => LevelFilter::Trace,
         _ => panic!("Invalid loglevel"),
     }
 }
@@ -148,8 +151,24 @@ fn datadir(matches: &getopts::Matches) -> PathBuf {
     })
 }
 
-fn setup_logging(loglevel: LogLevel) {
-    simple_logger::init_with_level(loglevel).expect("Could not initialize logger");
+fn setup_logging<P: AsRef<Path>>(datadir: P, level_filter: LevelFilter) -> io::Result<()> {
+    let log_file_path = datadir.as_ref().join("bitrust.log");
+    let log_file = OpenOptions::new().create(true).append(true).open(
+        &log_file_path,
+    )?;
+    CombinedLogger::init(vec![
+        TermLogger::new(
+            LevelFilter::Warn,
+            simplelog::Config::default()
+        ).unwrap(),
+        WriteLogger::new(
+            level_filter,
+            simplelog::Config::default(),
+            log_file
+        ),
+    ]).expect("Error setting up logging");
+
+    Ok(())
 }
 
 fn parse_opts() -> getopts::Matches {
@@ -157,5 +176,11 @@ fn parse_opts() -> getopts::Matches {
     let mut opts = getopts::Options::new();
     opts.optopt("l", "loglevel", "Log level", "LEVEL");
     opts.optopt("d", "datadir", "Data directory", "DATADIR");
+    opts.optopt(
+        "s",
+        "max_file_size",
+        "Max data file size in bytes",
+        "MAX_FILE_SIZE",
+    );
     opts.parse(&args[1..]).expect("Error parsing options")
 }

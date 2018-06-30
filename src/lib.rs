@@ -3,7 +3,10 @@ extern crate bytes;
 extern crate crc;
 #[macro_use]
 extern crate log;
-extern crate simple_logger;
+extern crate simplelog;
+extern crate regex;
+#[macro_use]
+extern crate lazy_static;
 
 mod util;
 mod lockfile;
@@ -25,6 +28,7 @@ use std::time::Duration;
 
 use bytes::{BytesMut, BufMut, IntoBuf, Buf};
 use byteorder::{ReadBytesExt, BigEndian};
+use regex::Regex;
 
 pub use config::*;
 
@@ -617,6 +621,25 @@ where
     Ok(Some(new_offset))
 }
 
+fn is_data_or_hint_file<P>(path: P) -> bool
+where
+    P: AsRef<Path>,
+{
+    lazy_static! {
+        static ref RE: Regex = Regex::new(r"^[0-9]+\.(?:data|hint)$").unwrap();
+    }
+    let maybe_file_name_str = path.as_ref()
+                                  .file_name()
+                                  .and_then(|s| s.to_str()) // OsStr -> &str
+                                  ;
+    if let Some(file_name_str) = maybe_file_name_str {
+        RE.is_match(file_name_str)
+    } else {
+        false
+    }
+}
+
+
 // Returns a HashMap from FileId to (DataFile, HintFile). HintFile can be absent
 // when a DataFile is there, but the reverse should never happen, and this
 // function panics in that case.
@@ -628,13 +651,7 @@ where
     for entry in fs::read_dir(data_dir)? {
         let file_path = entry.expect("Error reading data directory").path();
 
-        let file_basename = file_path
-            .file_stem()
-            .unwrap_or_else(|| panic!("Could not fild stemp for {:?}", &file_path))
-            .to_str()
-            .unwrap();
-
-        if file_basename.starts_with('.') {
+        if !is_data_or_hint_file(&file_path) {
             continue;
         }
 

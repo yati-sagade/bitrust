@@ -6,7 +6,7 @@ authors = ["Yati Sagade <mail@ysagade.nl>"]
 [dependencies]
 crc = "1.8.1"
 log = "^0.3.1"
-simple_logger = "^0.4"
+simplelog = "0.5.2"
 byteorder = "^1"
 bytes = "0.4"
 getopts = "0.2"
@@ -15,3 +15,5 @@ proptest = "0.7.2"
 rand = "0.3"
 fs2 = "0.4.3"
 ctrlc = { version = "3.0", features = [ "termination" ] }
+regex = "1"
+lazy_static = "1.0.1"
