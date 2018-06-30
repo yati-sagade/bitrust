@@ -7,6 +7,8 @@ extern crate simple_logger;
 
 mod util;
 mod lockfile;
+mod config;
+
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,6 +25,8 @@ use std::time::Duration;
 
 use bytes::{BytesMut, BufMut, IntoBuf, Buf};
 use byteorder::{ReadBytesExt, BigEndian};
+
+pub use config::*;
 
 // In bitcask, a DataFile contains records the actual key and value with some
 // metadata, encoded in a binary format. Hintfiles are written when a multiple
@@ -52,6 +56,7 @@ type FileID = u16;
 type FileMap = HashMap<FileID, PathBuf>;
 
 pub const BITRUST_TOMBSTONE_STR: &'static str = "<bitrust_tombstone>";
+
 
 // The datadir is a folder on the filesystem where we store our datafiles and
 // hintfiles. This data structure maps a given file id to a tuple that contains
@@ -699,6 +704,7 @@ pub struct BitRust {
     state: Arc<RwLock<BitRustState>>,
     background_thread: Option<thread::JoinHandle<()>>,
     running: Arc<atomic::AtomicBool>,
+    config: Config,
 }
 
 impl Drop for BitRust {
@@ -709,24 +715,25 @@ impl Drop for BitRust {
 }
 
 impl BitRust {
-    pub fn open<P>(datadir: P) -> io::Result<BitRust>
-    where
-        P: AsRef<Path>,
-    {
-        let state = BitRustState::new(datadir)?;
+    pub fn open(config: Config) -> io::Result<BitRust> {
+        let state = BitRustState::new(config.datadir())?;
         let state = Arc::new(RwLock::new(state));
         let running = Arc::new(atomic::AtomicBool::new(true));
 
         let state_cloned = state.clone();
         let running_cloned = running.clone();
+        let config_cloned = config.clone();
+
         let background_thread = Some(thread::spawn(move || {
             let bitrust_state = state_cloned;
-            background_checker(bitrust_state, running_cloned);
+            background_checker(bitrust_state, running_cloned, config_cloned);
         }));
+
         Ok(BitRust {
             state,
             background_thread,
             running,
+            config,
         })
     }
 
@@ -747,7 +754,11 @@ impl BitRust {
     }
 }
 
-fn background_checker(bitrust: Arc<RwLock<BitRustState>>, running: Arc<atomic::AtomicBool>) {
+fn background_checker(
+    bitrust: Arc<RwLock<BitRustState>>,
+    running: Arc<atomic::AtomicBool>,
+    config: Config,
+) {
     debug!("Started background thread");
     while running.load(atomic::Ordering::SeqCst) {
         thread::sleep(Duration::from_secs(1));

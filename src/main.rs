@@ -11,19 +11,19 @@ use std::process;
 use std::path::PathBuf;
 
 use log::LogLevel;
-use bitrust::BitRust;
+use bitrust::{BitRust, ConfigBuilder, Config};
 
 fn main() -> io::Result<()> {
     let matches = parse_opts();
     setup_logging(loglevel(&matches));
-    let data_dir = datadir(&matches);
-    info!("data_dir: {:?}", &data_dir);
-    let mut br = match BitRust::open(&data_dir) {
+    let config = build_config(&matches);
+    let datadir = config.datadir().to_path_buf();
+    let mut br = match BitRust::open(config) {
         Ok(br) => br,
         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
             eprintln!(
                 "Lock file {:?} exists, and is already held by pid {}",
-                data_dir.join(".lock"),
+                datadir.join(".lock"),
                 0
             );
             process::exit(1);
@@ -34,6 +34,18 @@ fn main() -> io::Result<()> {
     };
 
     cmd_loop(&mut br)
+}
+
+fn build_config(matches: &getopts::Matches) -> Config {
+    let data_dir = datadir(&matches);
+    let mut config = ConfigBuilder::new(data_dir);
+    if let Some(sz) = matches.opt_str("s") {
+        let max_file_fize_bytes = sz.parse::<u64>().unwrap_or_else(|e| {
+            panic!("Invalid value {} for -s: {:?}", sz, e);
+        });
+        config.max_file_fize_bytes(max_file_fize_bytes);
+    }
+    config.build()
 }
 
 fn prompt() -> io::Result<()> {
