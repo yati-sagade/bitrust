@@ -281,6 +281,11 @@ impl BitRustState {
         active_file_pointer_path(&self.data_dir)
     }
 
+    pub fn active_file_size(&mut self) -> io::Result<u64> {
+        let _lock = self.rwlock.write().unwrap();
+        self.active_file.tell()
+    }
+
     pub fn put(&mut self, key: String, value: String) -> io::Result<()> {
 
         let _lock = self.rwlock.write().unwrap();
@@ -778,7 +783,19 @@ fn background_checker(
 ) {
     debug!("Started background thread");
     while running.load(atomic::Ordering::SeqCst) {
-        thread::sleep(Duration::from_secs(1));
+        let mut bitrust_state = bitrust.write().unwrap();
+        let sz = bitrust_state.active_file_size().unwrap();
+        debug!(
+            "Active file size is {} bytes and the limit is {} bytes, {}",
+            sz,
+            config.max_file_fize_bytes(),
+            if sz >= config.max_file_fize_bytes() {
+                "renewing the active file"
+            } else {
+                "nothing to do"
+            },
+        );
+        thread::sleep(Duration::from_secs(3));
     }
     debug!("Exiting background thread");
 }
