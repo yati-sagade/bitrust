@@ -16,6 +16,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write, Seek, SeekFrom};
 use std::process;
 use std::mem;
+use std::sync::{RwLock, Arc};
+use std::thread;
+use std::sync::atomic;
+use std::time::Duration;
 
 use bytes::{BytesMut, BufMut, IntoBuf, Buf};
 use byteorder::{ReadBytesExt, BigEndian};
@@ -180,15 +184,22 @@ impl ActiveFile {
 }
 
 #[derive(Debug)]
-pub struct BitRust {
+pub struct BitRustState {
     keydir: KeyDir,
     data_dir: PathBuf,
     active_file: ActiveFile,
     lockfile: lockfile::LockFile,
+    // A ghost lock object, used to hold R/W locks on the entire bitrust
+    // instance.
+    rwlock: Arc<RwLock<()>>,
 }
 
-impl BitRust {
-    pub fn new<P>(data_dir: P) -> io::Result<BitRust>
+impl Drop for BitRustState {
+    fn drop(&mut self) {}
+}
+
+impl BitRustState {
+    pub fn new<P>(data_dir: P) -> io::Result<BitRustState>
     where
         P: AsRef<Path>,
     {
@@ -204,9 +215,11 @@ impl BitRust {
         //
         // This lock will be released (and the lockfile removed) when the
         // returned object goes out of scope. Since we move it into the
-        // returned BitRust, this means the lock lives as long as the returned
-        // BitRust lives.
+        // returned BitRustState, this means the lock lives as long as the returned
+        // BitRustState lives.
         let lockfile = get_process_lockfile(lockfile_path)?;
+
+        debug!("Obtained data directory lock");
 
         // Get the names of the data and hint files. Because these are named
         // like ${file_id}.data and ${file_id}.hint respectively, we can group
@@ -216,19 +229,52 @@ impl BitRust {
         // data files)
         let data_and_hint_files = get_data_and_hint_files(&data_dir)?;
 
+        debug!(
+            "Got {} data/hint file entries from {:?}",
+            data_and_hint_files.len(),
+            &data_dir
+        );
+
+        if data_and_hint_files.len() == 0 {
+            // We are starting from scratch, write the name of the active file
+            // as 0.data.
+            let ptr_path = active_file_pointer_path(&data_dir);
+            debug!(
+                "Starting in an empty data directory, writing {:?}",
+                &ptr_path
+            );
+            util::write_to_file(
+                &ptr_path,
+                data_dir.join("0.data").to_str().expect(
+                    "Garbled initial data file name?",
+                ),
+            )?;
+        }
+
         let keydir = build_key_dir(data_and_hint_files)?;
 
-        let bitrust = BitRust {
+        let active_file_name = active_file_path(&data_dir)?;
+
+        debug!("Using active file {:?}", &active_file_name);
+
+        let bitrust = BitRustState {
             keydir,
             data_dir: data_dir.to_path_buf(),
-            active_file: ActiveFile::new(data_dir.join("0.data"))?,
+            active_file: ActiveFile::new(active_file_name)?,
             lockfile,
+            rwlock: Arc::new(RwLock::new(())),
         };
 
         Ok(bitrust)
     }
 
+    fn active_file_pointer_path(&self) -> PathBuf {
+        active_file_pointer_path(&self.data_dir)
+    }
+
     pub fn put(&mut self, key: String, value: String) -> io::Result<()> {
+
+        let _lock = self.rwlock.write().unwrap();
 
         let key_bytes = key.clone().into_bytes();
         let val_bytes = value.into_bytes();
@@ -263,7 +309,7 @@ impl BitRust {
 
         payload_head.put_u32_be(checksum);
 
-        // Now payload_head contains all of the record we want to write out,
+        // Now payload_head contains all of the record we want to write out,(
         // including the checksum.
         payload_head.unsplit(payload);
 
@@ -288,6 +334,9 @@ impl BitRust {
     }
 
     pub fn get(&mut self, key: &str) -> io::Result<Option<String>> {
+
+        let _lock = self.rwlock.read().unwrap();
+
         let entry = self.keydir.get(key);
         if let Some(entry) = entry {
             // Read required bytes
@@ -348,6 +397,7 @@ impl BitRust {
     }
 
     pub fn keys(&self) -> Vec<String> {
+        let _lock = self.rwlock.read().unwrap();
         self.keydir.entries.keys().cloned().collect()
     }
 }
@@ -645,6 +695,78 @@ where
     lockfile::LockFile::new(path, Some(our_pid_str.as_bytes()))
 }
 
+pub struct BitRust {
+    state: Arc<RwLock<BitRustState>>,
+    background_thread: Option<thread::JoinHandle<()>>,
+    running: Arc<atomic::AtomicBool>,
+}
+
+impl Drop for BitRust {
+    fn drop(&mut self) {
+        self.running.store(false, atomic::Ordering::SeqCst);
+        self.background_thread.take().unwrap().join().unwrap();
+    }
+}
+
+impl BitRust {
+    pub fn open<P>(datadir: P) -> io::Result<BitRust>
+    where
+        P: AsRef<Path>,
+    {
+        let state = BitRustState::new(datadir)?;
+        let state = Arc::new(RwLock::new(state));
+        let running = Arc::new(atomic::AtomicBool::new(true));
+
+        let state_cloned = state.clone();
+        let running_cloned = running.clone();
+        let background_thread = Some(thread::spawn(move || {
+            let bitrust_state = state_cloned;
+            background_checker(bitrust_state, running_cloned);
+        }));
+        Ok(BitRust {
+            state,
+            background_thread,
+            running,
+        })
+    }
+
+    pub fn get(&mut self, key: &str) -> io::Result<Option<String>> {
+        self.state.write().unwrap().get(key)
+    }
+
+    pub fn put(&mut self, key: String, value: String) -> io::Result<()> {
+        self.state.write().unwrap().put(key, value)
+    }
+
+    pub fn delete(&mut self, key: &str) -> io::Result<()> {
+        self.state.write().unwrap().delete(key)
+    }
+
+    pub fn keys(&self) -> Vec<String> {
+        self.state.read().unwrap().keys()
+    }
+}
+
+fn background_checker(bitrust: Arc<RwLock<BitRustState>>, running: Arc<atomic::AtomicBool>) {
+    debug!("Started background thread");
+    while running.load(atomic::Ordering::SeqCst) {
+        thread::sleep(Duration::from_secs(1));
+    }
+    debug!("Exiting background thread");
+}
+
+fn active_file_pointer_path<P: AsRef<Path>>(data_dir: P) -> PathBuf {
+    data_dir.as_ref().join(".activefile")
+}
+
+fn active_file_path<P: AsRef<Path>>(data_dir: P) -> io::Result<PathBuf> {
+    let ptr_path = active_file_pointer_path(data_dir);
+    let mut fp = File::open(ptr_path)?;
+    let mut buf = String::new();
+    fp.read_to_string(&mut buf)?;
+    Ok(PathBuf::from(buf))
+}
+
 #[cfg(test)]
 mod test {
     extern crate tempfile;
@@ -777,7 +899,7 @@ mod test {
     #[test]
     fn test_creation() {
         let data_dir = tempfile::tempdir().unwrap();
-        let mut br = BitRust::new(data_dir.path()).unwrap();
+        let mut br = BitRustState::new(data_dir.path()).unwrap();
 
         br.put("foo".to_string(), "bar".to_string()).unwrap();
         let r = br.get("foo").unwrap().unwrap();
@@ -787,9 +909,9 @@ mod test {
     #[test]
     fn test_locking_of_data_dir() {
         let data_dir = tempfile::tempdir().unwrap();
-        let _br = BitRust::new(data_dir.path()).unwrap();
+        let _br = BitRustState::new(data_dir.path()).unwrap();
 
-        let another_br = BitRust::new(data_dir.path());
+        let another_br = BitRustState::new(data_dir.path());
         assert!(another_br.is_err());
         if let Err(e) = another_br {
             assert!(e.kind() == io::ErrorKind::AlreadyExists);
@@ -799,7 +921,7 @@ mod test {
     #[test]
     fn test_deletion() {
         let data_dir = tempfile::tempdir().unwrap();
-        let mut br = BitRust::new(data_dir.path()).unwrap();
+        let mut br = BitRustState::new(data_dir.path()).unwrap();
 
         br.put("foo".to_string(), "bar".to_string()).unwrap();
         assert!(br.get("foo").unwrap().unwrap() == "bar");

@@ -4,7 +4,7 @@ extern crate rand;
 
 use std::collections::HashMap;
 use rand::Rng;
-use bitrust::BitRust;
+use bitrust::BitRustState;
 
 fn rand_str() -> String {
     let size: usize = rand::thread_rng().gen_range(4, 1024);
@@ -14,7 +14,7 @@ fn rand_str() -> String {
 #[test]
 fn test_model_based_load_store() {
     let data_dir = tempfile::tempdir().unwrap();
-    let mut br = BitRust::new(data_dir.path()).unwrap();
+    let mut br = BitRustState::new(data_dir.path()).unwrap();
     let mut model = HashMap::new();
 
     for _ in 0..1000 {
