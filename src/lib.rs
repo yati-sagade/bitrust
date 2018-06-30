@@ -1,6 +1,10 @@
+#![feature(test)]
 extern crate byteorder;
 extern crate bytes;
 extern crate crc;
+extern crate test;
+extern crate rand;
+
 #[macro_use]
 extern crate log;
 extern crate simplelog;
@@ -8,13 +12,13 @@ extern crate regex;
 #[macro_use]
 extern crate lazy_static;
 
-mod util;
+pub mod util;
 mod lockfile;
 mod config;
 
 
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use std::path::{PathBuf, Path};
 use std::io;
 use std::fs::{self, File, OpenOptions};
@@ -275,10 +279,6 @@ impl BitRustState {
         };
 
         Ok(bitrust)
-    }
-
-    fn active_file_pointer_path(&self) -> PathBuf {
-        active_file_pointer_path(&self.data_dir)
     }
 
     pub fn active_file_size(&mut self) -> io::Result<u64> {
@@ -764,7 +764,21 @@ impl BitRust {
     }
 
     pub fn put(&mut self, key: String, value: String) -> io::Result<()> {
-        self.state.write().unwrap().put(key, value)
+
+        let start = Instant::now();
+        let mut state = self.state.write().unwrap();
+        let end = Instant::now();
+        let dur = end - start;
+        let ms = dur.as_secs() * 1000 + dur.subsec_millis() as u64;
+        debug!("locking for put took {}ms", ms);
+
+        let start = Instant::now();
+        let ret = state.put(key, value);
+        let end = Instant::now();
+        let dur = end - start;
+        let ms = dur.as_secs() * 1000 + dur.subsec_millis() as u64;
+        debug!("put took {}ms", ms);
+        ret
     }
 
     pub fn delete(&mut self, key: &str) -> io::Result<()> {
@@ -813,8 +827,11 @@ fn active_file_path<P: AsRef<Path>>(data_dir: P) -> io::Result<PathBuf> {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
+
     extern crate tempfile;
+
+    use test::Bencher;
     use std::io::Cursor;
     use super::*;
 
@@ -973,5 +990,16 @@ mod test {
 
         br.delete("foo").unwrap();
         assert!(br.get("foo").unwrap().is_none());
+    }
+
+    #[bench]
+    fn bench_put(b: &mut Bencher) {
+        let data_dir = tempfile::tempdir().unwrap();
+        let config = ConfigBuilder::new(&data_dir).build();
+        let mut br = BitRust::open(config).unwrap();
+
+        let key = util::rand_str();
+        let val = util::rand_str();
+        b.iter(move || { br.put(key.clone(), val.clone()).unwrap(); });
     }
 }

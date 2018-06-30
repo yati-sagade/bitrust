@@ -1,15 +1,10 @@
 extern crate bitrust;
 extern crate tempfile;
-extern crate rand;
 
 use std::collections::HashMap;
-use rand::Rng;
 use bitrust::BitRustState;
+use bitrust::util::rand_str;
 
-fn rand_str() -> String {
-    let size: usize = rand::thread_rng().gen_range(4, 1024);
-    rand::thread_rng().gen_iter::<char>().take(size).collect()
-}
 
 #[test]
 fn test_model_based_load_store() {

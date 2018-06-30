@@ -18,7 +18,7 @@ fn main() -> io::Result<()> {
     let matches = parse_opts();
     let config = build_config(&matches);
     let datadir = config.datadir().to_path_buf();
-    setup_logging(&datadir, log_level_filter(&matches));
+    setup_logging(&datadir, log_level_filter(&matches))?;
     let mut br = match BitRust::open(config) {
         Ok(br) => br,
         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
