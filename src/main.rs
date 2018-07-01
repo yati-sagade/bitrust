@@ -4,7 +4,9 @@ extern crate log;
 extern crate simplelog;
 extern crate getopts;
 extern crate ctrlc;
+extern crate tempfile;
 
+use std::time::Instant;
 use std::io::{self, Write};
 use std::env;
 use std::process;
@@ -13,6 +15,7 @@ use std::fs::OpenOptions;
 
 use simplelog::{CombinedLogger, TermLogger, WriteLogger, LevelFilter};
 use bitrust::{BitRust, ConfigBuilder, Config};
+use bitrust::util;
 
 fn main() -> io::Result<()> {
     let matches = parse_opts();
@@ -33,8 +36,14 @@ fn main() -> io::Result<()> {
             return Err(e);
         }
     };
-
-    cmd_loop(&mut br)
+    if let Some(cmd) = matches.opt_str("b") {
+        match cmd.as_str() {
+            "put" => bench_put(&mut br),
+            _ => panic!("Invalid input to -b"),
+        }
+    } else {
+        cmd_loop(&mut br)
+    }
 }
 
 fn build_config(matches: &getopts::Matches) -> Config {
@@ -177,10 +186,54 @@ fn parse_opts() -> getopts::Matches {
     opts.optopt("l", "loglevel", "Log level", "LEVEL");
     opts.optopt("d", "datadir", "Data directory", "DATADIR");
     opts.optopt(
+        "b",
+        "bench",
+        "Print benchmark stats for an operation and exit",
+        "KIND",
+    );
+    opts.optopt(
         "s",
         "max_file_size",
         "Max data file size in bytes",
         "MAX_FILE_SIZE",
     );
     opts.parse(&args[1..]).expect("Error parsing options")
+}
+
+fn bench_put(br: &mut BitRust) -> io::Result<()> {
+    let data_dir = tempfile::tempdir().unwrap();
+    let config = ConfigBuilder::new(&data_dir).build();
+    let mut br = BitRust::open(config).unwrap();
+
+    let mut durs = Vec::new();
+    for _ in 0..10 {
+        let key = util::rand_str();
+        let val = util::rand_str();
+        let begin = Instant::now();
+        br.put(key, val)?;
+        let end = Instant::now();
+        let dur = end - begin;
+        let ms = dur.as_secs() * 1000 + dur.subsec_millis() as u64;
+        durs.push(ms);
+    }
+
+    let (mean, std) = mean_std(&durs);
+    println!("mean={},std={}", mean, std);
+    Ok(())
+}
+
+fn mean_std(vals: &[u64]) -> (f64, f64) {
+    let mut sum = 0f64;
+    let mut sq_sum = 0f64;
+
+    for val in vals.iter().cloned() {
+        let val = val as f64;
+        sum += val;
+        sq_sum += val * val;
+    }
+
+    let mean = sum / vals.len() as f64;
+    let mean_sq = sq_sum / vals.len() as f64;
+    let var = mean_sq - mean * mean;
+    (mean, var.sqrt())
 }
