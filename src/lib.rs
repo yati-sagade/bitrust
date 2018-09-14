@@ -224,6 +224,18 @@ struct InactiveFile {
     pub id: FileID,
 }
 
+impl InactiveFile {
+    fn new(path: PathBuf) -> io::Result<InactiveFile> {
+        let read_handle = OpenOptions::new().read(true).create(false).open(&path)?;
+        let id = file_id_from_path(&path);
+        Ok(InactiveFile {
+            read_handle: read_handle,
+            name: path,
+            id: id,
+        })
+    }
+}
+
 impl ReadableFile for InactiveFile {
     fn file<'a>(&'a mut self) -> io::Result<&'a mut File> {
         Ok(&mut self.read_handle)
@@ -307,17 +319,29 @@ impl BitRustState {
             )?;
         }
 
-        let keydir = build_key_dir(data_and_hint_files)?;
+        // We should probably build the keydir and the `active_file` and
+        // `inactive_file` fields together, but it is just simpler to first
+        // build the keydir and then do another pass to build the other fields.
+        let keydir = build_key_dir(data_and_hint_files.clone())?;
 
         let active_file_name = active_file_path(&data_dir)?;
-
         debug!("Using active file {:?}", &active_file_name);
+
+        let active_file = ActiveFile::new(active_file_name)?;
+
+        let mut inactive_files = HashMap::new();
+        for (file_id, (data_file, _)) in data_and_hint_files.into_iter() {
+            let data_file = data_file.expect("data file path is none!");
+            if file_id != active_file.id {
+                inactive_files.insert(file_id, InactiveFile::new(data_file)?);
+            }
+        }
 
         let bitrust = BitRustState {
             keydir,
             config: config,
-            active_file: ActiveFile::new(active_file_name)?,
-            inactive_files: HashMap::new(),
+            inactive_files: inactive_files,
+            active_file: active_file,
             lockfile,
             rwlock: Arc::new(RwLock::new(())),
         };
