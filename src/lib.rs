@@ -26,15 +26,25 @@ use std::io::{Read, Write, Seek, SeekFrom};
 use std::process;
 use std::mem;
 use std::sync::{RwLock, Arc};
-use std::thread;
 use std::sync::atomic;
-use std::time::Duration;
 
 use bytes::{BytesMut, BufMut, IntoBuf, Buf};
 use byteorder::{ReadBytesExt, BigEndian};
 use regex::Regex;
 
 pub use config::*;
+
+macro_rules! debug_timeit {
+    ( $name:expr => $b:block ) => {{
+        let start = Instant::now();
+        let ret = $b;
+        let end = Instant::now();
+        let dur = end - start;
+        let ns = dur.as_secs() * 1_000_000_000 + dur.subsec_nanos() as u64;
+        debug!("{} took {}ns", $name, ns);
+        ret
+    }};
+}
 
 // In bitcask, a DataFile contains records the actual key and value with some
 // metadata, encoded in a binary format. Hintfiles are written when a multiple
@@ -179,11 +189,6 @@ impl ActiveFile {
         Ok(active_file)
     }
 
-    pub fn read_exact(&mut self, offset_from_start: u64, bytes: &mut [u8]) -> io::Result<()> {
-        self.read_handle.seek(SeekFrom::Start(offset_from_start))?;
-        self.read_handle.read_exact(bytes)
-    }
-
     /// Returns the offset of the first byte of written record in the file.
     pub fn append(&mut self, bytes: &[u8]) -> io::Result<u64> {
         let offset = self.tell()?;
@@ -196,11 +201,51 @@ impl ActiveFile {
     }
 }
 
+trait ReadableFile {
+    fn file<'a>(&'a mut self) -> io::Result<&'a mut File>;
+
+    fn read_exact(&mut self, offset_from_start: u64, bytes: &mut [u8]) -> io::Result<()> {
+        let fp = self.file()?;
+        fp.seek(SeekFrom::Start(offset_from_start))?;
+        fp.read_exact(bytes)
+    }
+}
+
+impl ReadableFile for ActiveFile {
+    fn file<'a>(&'a mut self) -> io::Result<&'a mut File> {
+        Ok(&mut self.read_handle)
+    }
+}
+
+#[derive(Debug)]
+struct InactiveFile {
+    read_handle: File,
+    pub name: PathBuf,
+    pub id: FileID,
+}
+
+impl ReadableFile for InactiveFile {
+    fn file<'a>(&'a mut self) -> io::Result<&'a mut File> {
+        Ok(&mut self.read_handle)
+    }
+}
+
+impl Into<InactiveFile> for ActiveFile {
+    fn into(self) -> InactiveFile {
+        InactiveFile {
+            read_handle: self.read_handle,
+            name: self.name,
+            id: self.id,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct BitRustState {
     keydir: KeyDir,
     data_dir: PathBuf,
     active_file: ActiveFile,
+    inactive_files: HashMap<FileID, InactiveFile>,
     lockfile: lockfile::LockFile,
     // A ghost lock object, used to hold R/W locks on the entire bitrust
     // instance.
@@ -274,6 +319,7 @@ impl BitRustState {
             keydir,
             data_dir: data_dir.to_path_buf(),
             active_file: ActiveFile::new(active_file_name)?,
+            inactive_files: HashMap::new(),
             lockfile,
             rwlock: Arc::new(RwLock::new(())),
         };
@@ -284,6 +330,10 @@ impl BitRustState {
     pub fn active_file_size(&mut self) -> io::Result<u64> {
         let _lock = self.rwlock.write().unwrap();
         self.active_file.tell()
+    }
+
+    pub fn merge(&mut self) -> io::Result<()> {
+        Ok(())
     }
 
     pub fn put(&mut self, key: String, value: String) -> io::Result<()> {
@@ -344,6 +394,18 @@ impl BitRustState {
             self.active_file.tell()?
         );
 
+        // Borrowing the field directly is needed here since self cannot be
+        // borrowed mutably because of the rwlock in scope, which has an
+        // immutable borrow on self until the function ends.
+        //
+        // This is also why maybe_seal_active_data() is a function accepting
+        // our fields mutably rather than a method on &mut self.
+        let inactive_files = &mut self.inactive_files;
+        maybe_seal_active_data(&mut self.active_file, &self.data_dir)?
+            .map(|inactive_file| {
+                inactive_files.insert(inactive_file.id, inactive_file)
+            });
+
         Ok(())
     }
 
@@ -362,10 +424,26 @@ impl BitRustState {
                 entry.record_offset
             );
 
-            self.active_file.read_exact(
-                entry.record_offset,
-                &mut read_buf,
-            )?;
+            if entry.file_id == self.active_file.id {
+                debug!("Fetching from active file (id {})", entry.file_id);
+                self.active_file.read_exact(
+                    entry.record_offset,
+                    &mut read_buf,
+                )?;
+            } else {
+                // if the key is not present in the store, we won't reach here
+                // (`entry` would be None). Having an entry pointing to a file
+                // we don't know about is bad.
+                debug!("Fetching from inactive file id {}", entry.file_id);
+                let mut file = self.inactive_files
+                                   .get_mut(&entry.file_id)
+                                   .unwrap_or_else(|| panic!(
+"Got a request for inactive file id {}, but it was not loaded, this is really bad!",
+                                        entry.file_id
+                                    ));
+                file.read_exact(entry.record_offset, &mut read_buf)?;
+            }
+
             debug!("Read {} bytes", read_buf.len());
 
             // We use a BytesMut for the easy extractor methods for which
@@ -415,6 +493,54 @@ impl BitRustState {
         self.keydir.entries.keys().cloned().collect()
     }
 }
+
+fn should_seal_active_data(active_file: &mut ActiveFile) -> io::Result<bool> {
+    // XXX: Read from config instead of hardcoding to 16MiB
+    active_file.tell().map(|size| size > 16 * 1024 * 1024)
+}
+
+fn update_active_file_id<P: AsRef<Path>>(data_dir: P, id: FileID) -> io::Result<PathBuf> {
+    let new_active_file_name = format!("{}.data", id);
+    let new_active_file_path = data_dir.as_ref().join(&new_active_file_name);
+    let ptr_path = active_file_pointer_path(data_dir);
+    util::write_to_file(
+        &ptr_path,
+        new_active_file_path.to_str().expect(
+            "Garbled data file name",
+        ),
+    )?;
+    Ok(new_active_file_path)
+}
+
+// This fn is not thread safe, and assumes that we have a write lock
+// on the state.
+fn maybe_seal_active_data<P: AsRef<Path>>(
+    active_file: &mut ActiveFile,
+    data_dir: P,
+) -> io::Result<Option<InactiveFile>> {
+    // Ultimately we want to close the current active file and start
+    // writing to a new one. The pointers into the old file should still
+    // be active.
+    let will_seal = should_seal_active_data(active_file)?;
+    if will_seal {
+        debug!("Active file is too big, sealing");
+        let old_active_file = {
+            // XXX: ensure there are no conflicts
+            let new_active_file_id = active_file.id + 1;
+            let new_active_file_path = update_active_file_id(data_dir, new_active_file_id)?;
+            debug!("New active file is {:?}", &new_active_file_path);
+            let mut new_active_file = ActiveFile::new(new_active_file_path)?;
+            std::mem::swap(&mut new_active_file, active_file);
+            new_active_file
+        };
+        debug!("Making file {} inactive", old_active_file.id);
+        Ok(Some(old_active_file.into()))
+    //self.inactive_files.insert(inactive_file.id, inactive_file);
+    } else {
+        Ok(None)
+    }
+}
+
 
 fn build_key_dir(dd_contents: DataDirContents) -> io::Result<KeyDir> {
     info!("Making keydir");
@@ -723,8 +849,7 @@ where
 }
 
 pub struct BitRust {
-    state: Arc<RwLock<BitRustState>>,
-    background_thread: Option<thread::JoinHandle<()>>,
+    state: BitRustState,
     running: Arc<atomic::AtomicBool>,
     config: Config,
 }
@@ -732,86 +857,50 @@ pub struct BitRust {
 impl Drop for BitRust {
     fn drop(&mut self) {
         self.running.store(false, atomic::Ordering::SeqCst);
-        self.background_thread.take().unwrap().join().unwrap();
     }
 }
 
 impl BitRust {
     pub fn open(config: Config) -> io::Result<BitRust> {
         let state = BitRustState::new(config.datadir())?;
-        let state = Arc::new(RwLock::new(state));
         let running = Arc::new(atomic::AtomicBool::new(true));
-
-        let state_cloned = state.clone();
-        let running_cloned = running.clone();
-        let config_cloned = config.clone();
-
-        let background_thread = Some(thread::spawn(move || {
-            let bitrust_state = state_cloned;
-            background_checker(bitrust_state, running_cloned, config_cloned);
-        }));
 
         Ok(BitRust {
             state,
-            background_thread,
             running,
             config,
         })
     }
 
     pub fn get(&mut self, key: &str) -> io::Result<Option<String>> {
-        self.state.write().unwrap().get(key)
+        debug_timeit!("get" => {
+            self.state.get(key)
+        })
     }
 
     pub fn put(&mut self, key: String, value: String) -> io::Result<()> {
-
-        let start = Instant::now();
-        let mut state = self.state.write().unwrap();
-        let end = Instant::now();
-        let dur = end - start;
-        let ms = dur.as_secs() * 1000 + dur.subsec_millis() as u64;
-        debug!("locking for put took {}ms", ms);
-
-        let start = Instant::now();
-        let ret = state.put(key, value);
-        let end = Instant::now();
-        let dur = end - start;
-        let ms = dur.as_secs() * 1000 + dur.subsec_millis() as u64;
-        debug!("put took {}ms", ms);
-        ret
+        debug_timeit!("put" => {
+            self.state.put(key, value)
+        })
     }
 
     pub fn delete(&mut self, key: &str) -> io::Result<()> {
-        self.state.write().unwrap().delete(key)
+        debug_timeit!("delete" => {
+            self.state.delete(key)
+        })
     }
 
     pub fn keys(&self) -> Vec<String> {
-        self.state.read().unwrap().keys()
+        debug_timeit!("keys" => {
+            self.state.keys()
+        })
     }
-}
 
-fn background_checker(
-    bitrust: Arc<RwLock<BitRustState>>,
-    running: Arc<atomic::AtomicBool>,
-    config: Config,
-) {
-    debug!("Started background thread");
-    while running.load(atomic::Ordering::SeqCst) {
-        let mut bitrust_state = bitrust.write().unwrap();
-        let sz = bitrust_state.active_file_size().unwrap();
-        debug!(
-            "Active file size is {} bytes and the limit is {} bytes, {}",
-            sz,
-            config.max_file_fize_bytes(),
-            if sz >= config.max_file_fize_bytes() {
-                "renewing the active file"
-            } else {
-                "nothing to do"
-            },
-        );
-        thread::sleep(Duration::from_secs(3));
+    pub fn merge(&mut self) -> io::Result<()> {
+        debug_timeit!("merge" => {
+            self.state.merge()
+        })
     }
-    debug!("Exiting background thread");
 }
 
 fn active_file_pointer_path<P: AsRef<Path>>(data_dir: P) -> PathBuf {
