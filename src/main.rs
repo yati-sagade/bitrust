@@ -18,7 +18,15 @@ use bitrust::{BitRust, ConfigBuilder, Config};
 use bitrust::util;
 
 fn main() -> io::Result<()> {
-    let matches = parse_opts();
+    let args: Vec<String> = env::args().collect();
+    let (matches, opts) = parse_opts(&args[1..]);
+    let program = &args[0];
+
+    if matches.opt_present("h") {
+        print_usage(program, opts);
+        process::exit(0);
+    }
+
     let config = build_config(&matches);
     let datadir = config.datadir().to_path_buf();
     setup_logging(&datadir, log_level_filter(&matches))?;
@@ -38,7 +46,7 @@ fn main() -> io::Result<()> {
     };
     if let Some(cmd) = matches.opt_str("b") {
         match cmd.as_str() {
-            "put" => bench_put(&mut br),
+            "put" => bench_put(),
             _ => panic!("Invalid input to -b"),
         }
     } else {
@@ -108,6 +116,7 @@ fn cmd_loop(br: &mut BitRust) -> io::Result<()> {
         } else if cmd[0] == "put" {
             if cmd.len() != 3 {
                 println!("{}", get_usage(&cmd_usages, "put").unwrap());
+                continue;
             }
             let key = cmd[1];
             let val = cmd[2];
@@ -115,6 +124,7 @@ fn cmd_loop(br: &mut BitRust) -> io::Result<()> {
         } else if cmd[0] == "get" {
             if cmd.len() != 2 {
                 println!("{}", get_usage(&cmd_usages, "get").unwrap());
+                continue;
             }
             let key = cmd[1];
             println!("{:?}", br.get(key));
@@ -125,6 +135,7 @@ fn cmd_loop(br: &mut BitRust) -> io::Result<()> {
         } else if cmd[0] == "del" {
             if cmd.len() != 2 {
                 println!("{}", get_usage(&cmd_usages, "del").unwrap());
+                continue;
             }
             println!("{:?}", br.delete(cmd[1]));
         } else if cmd[0] == "exit" || cmd[0] == "quit" {
@@ -180,9 +191,10 @@ fn setup_logging<P: AsRef<Path>>(datadir: P, level_filter: LevelFilter) -> io::R
     Ok(())
 }
 
-fn parse_opts() -> getopts::Matches {
-    let args: Vec<String> = env::args().collect();
+// Returns the matches, options and the program name on the command line
+fn parse_opts(args: &[String]) -> (getopts::Matches, getopts::Options) {
     let mut opts = getopts::Options::new();
+    opts.optflag("h", "help", "Print this help message and quit");
     opts.optopt("l", "loglevel", "Log level", "LEVEL");
     opts.optopt("d", "datadir", "Data directory", "DATADIR");
     opts.optopt(
@@ -197,32 +209,42 @@ fn parse_opts() -> getopts::Matches {
         "Max data file size in bytes",
         "MAX_FILE_SIZE",
     );
-    opts.parse(&args[1..]).expect("Error parsing options")
+    let matches = opts.parse(args).expect("Error parsing options");
+    (matches, opts)
 }
 
-fn bench_put(br: &mut BitRust) -> io::Result<()> {
+fn bench_put() -> io::Result<()> {
     let data_dir = tempfile::tempdir().unwrap();
     let config = ConfigBuilder::new(&data_dir).build();
     let mut br = BitRust::open(config).unwrap();
 
+    let kvs = (0..10000)
+        .map(|_| (util::rand_str(), util::rand_str()))
+        .collect::<Vec<_>>();
+
+    let total_writes = kvs.len() as f64;
     let mut durs = Vec::new();
-    for _ in 0..10 {
-        let key = util::rand_str();
-        let val = util::rand_str();
+    let mut dur_sum = 0f64;
+    for (key, val) in kvs {
+
         let begin = Instant::now();
         br.put(key, val)?;
         let end = Instant::now();
+
         let dur = end - begin;
-        let ms = dur.as_secs() * 1000 + dur.subsec_millis() as u64;
-        durs.push(ms);
+        let ns = dur.as_secs() * 1_000_000_000 + dur.subsec_nanos() as u64;
+        durs.push(ns);
+        dur_sum += ns as f64;
     }
 
-    let (mean, std) = mean_std(&durs);
-    println!("mean={},std={}", mean, std);
+    println!(
+        "puts per second in this run: {}",
+        total_writes / dur_sum * 1_000_000_000f64
+    );
     Ok(())
 }
 
-fn mean_std(vals: &[u64]) -> (f64, f64) {
+fn _mean_std(vals: &[u64]) -> (f64, f64) {
     let mut sum = 0f64;
     let mut sq_sum = 0f64;
 
@@ -236,4 +258,9 @@ fn mean_std(vals: &[u64]) -> (f64, f64) {
     let mean_sq = sq_sum / vals.len() as f64;
     let var = mean_sq - mean * mean;
     (mean, var.sqrt())
+}
+
+fn print_usage(program: &str, opts: getopts::Options) {
+    let brief = format!("Usage: {} [options]", program);
+    print!("{}", opts.usage(&brief));
 }
