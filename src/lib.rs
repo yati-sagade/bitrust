@@ -243,13 +243,14 @@ impl Into<InactiveFile> for ActiveFile {
 #[derive(Debug)]
 pub struct BitRustState {
     keydir: KeyDir,
-    data_dir: PathBuf,
     active_file: ActiveFile,
     inactive_files: HashMap<FileID, InactiveFile>,
     lockfile: lockfile::LockFile,
     // A ghost lock object, used to hold R/W locks on the entire bitrust
     // instance.
     rwlock: Arc<RwLock<()>>,
+
+    config: Config,
 }
 
 impl Drop for BitRustState {
@@ -257,14 +258,11 @@ impl Drop for BitRustState {
 }
 
 impl BitRustState {
-    pub fn new<P>(data_dir: P) -> io::Result<BitRustState>
-    where
-        P: AsRef<Path>,
-    {
+    pub fn new(config: Config) -> io::Result<BitRustState> {
         info!("Making a bitrust");
-        fs::create_dir_all(data_dir.as_ref())?;
+        fs::create_dir_all(config.datadir())?;
 
-        let data_dir = data_dir.as_ref().to_path_buf();
+        let data_dir = config.datadir().to_path_buf();
         let lockfile_path = data_dir.join(".lock");
 
         // If the following fails, all it means is that we have a file at our
@@ -317,7 +315,7 @@ impl BitRustState {
 
         let bitrust = BitRustState {
             keydir,
-            data_dir: data_dir.to_path_buf(),
+            config: config,
             active_file: ActiveFile::new(active_file_name)?,
             inactive_files: HashMap::new(),
             lockfile,
@@ -401,7 +399,7 @@ impl BitRustState {
         // This is also why maybe_seal_active_data() is a function accepting
         // our fields mutably rather than a method on &mut self.
         let inactive_files = &mut self.inactive_files;
-        maybe_seal_active_data(&mut self.active_file, &self.data_dir)?
+        maybe_seal_active_data(&mut self.active_file, &self.config)?
             .map(|inactive_file| {
                 inactive_files.insert(inactive_file.id, inactive_file)
             });
@@ -494,15 +492,19 @@ impl BitRustState {
     }
 }
 
-fn should_seal_active_data(active_file: &mut ActiveFile) -> io::Result<bool> {
+fn should_seal_active_data(active_file: &mut ActiveFile, config: &Config) -> io::Result<bool> {
     // XXX: Read from config instead of hardcoding to 16MiB
-    active_file.tell().map(|size| size > 16 * 1024 * 1024)
+    active_file.tell().map(
+        |size| size > config.max_file_fize_bytes(),
+    )
 }
 
-fn update_active_file_id<P: AsRef<Path>>(data_dir: P, id: FileID) -> io::Result<PathBuf> {
+fn update_active_file_id(id: FileID, config: &Config) -> io::Result<PathBuf> {
     let new_active_file_name = format!("{}.data", id);
-    let new_active_file_path = data_dir.as_ref().join(&new_active_file_name);
+    let data_dir = config.datadir();
+    let new_active_file_path = data_dir.join(&new_active_file_name);
     let ptr_path = active_file_pointer_path(data_dir);
+
     util::write_to_file(
         &ptr_path,
         new_active_file_path.to_str().expect(
@@ -514,20 +516,20 @@ fn update_active_file_id<P: AsRef<Path>>(data_dir: P, id: FileID) -> io::Result<
 
 // This fn is not thread safe, and assumes that we have a write lock
 // on the state.
-fn maybe_seal_active_data<P: AsRef<Path>>(
+fn maybe_seal_active_data(
     active_file: &mut ActiveFile,
-    data_dir: P,
+    config: &Config,
 ) -> io::Result<Option<InactiveFile>> {
     // Ultimately we want to close the current active file and start
     // writing to a new one. The pointers into the old file should still
     // be active.
-    let will_seal = should_seal_active_data(active_file)?;
+    let will_seal = should_seal_active_data(active_file, config)?;
     if will_seal {
         debug!("Active file is too big, sealing");
         let old_active_file = {
             // XXX: ensure there are no conflicts
             let new_active_file_id = active_file.id + 1;
-            let new_active_file_path = update_active_file_id(data_dir, new_active_file_id)?;
+            let new_active_file_path = update_active_file_id(new_active_file_id, config)?;
             debug!("New active file is {:?}", &new_active_file_path);
             let mut new_active_file = ActiveFile::new(new_active_file_path)?;
             std::mem::swap(&mut new_active_file, active_file);
@@ -851,7 +853,6 @@ where
 pub struct BitRust {
     state: BitRustState,
     running: Arc<atomic::AtomicBool>,
-    config: Config,
 }
 
 impl Drop for BitRust {
@@ -862,14 +863,10 @@ impl Drop for BitRust {
 
 impl BitRust {
     pub fn open(config: Config) -> io::Result<BitRust> {
-        let state = BitRustState::new(config.datadir())?;
+        let state = BitRustState::new(config)?;
         let running = Arc::new(atomic::AtomicBool::new(true));
 
-        Ok(BitRust {
-            state,
-            running,
-            config,
-        })
+        Ok(BitRust { state, running })
     }
 
     pub fn get(&mut self, key: &str) -> io::Result<Option<String>> {
