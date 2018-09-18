@@ -265,10 +265,6 @@ pub struct BitRustState {
     config: Config,
 }
 
-impl Drop for BitRustState {
-    fn drop(&mut self) {}
-}
-
 impl BitRustState {
     pub fn new(config: Config) -> io::Result<BitRustState> {
         info!("Making a bitrust");
@@ -944,6 +940,7 @@ mod tests {
     use test::Bencher;
     use std::io::Cursor;
     use super::*;
+    use std::ffi::OsStr;
 
     #[test]
     fn test_file_id_from_path() {
@@ -1071,7 +1068,8 @@ mod tests {
     #[test]
     fn test_creation() {
         let data_dir = tempfile::tempdir().unwrap();
-        let mut br = BitRustState::new(data_dir.path()).unwrap();
+        let cfg = ConfigBuilder::new(&data_dir).build();
+        let mut br = BitRustState::new(cfg).unwrap();
 
         br.put("foo".to_string(), "bar".to_string()).unwrap();
         let r = br.get("foo").unwrap().unwrap();
@@ -1081,9 +1079,10 @@ mod tests {
     #[test]
     fn test_locking_of_data_dir() {
         let data_dir = tempfile::tempdir().unwrap();
-        let _br = BitRustState::new(data_dir.path()).unwrap();
+        let cfg = ConfigBuilder::new(&data_dir).build();
+        let _br = BitRustState::new(cfg.clone()).unwrap();
 
-        let another_br = BitRustState::new(data_dir.path());
+        let another_br = BitRustState::new(cfg);
         assert!(another_br.is_err());
         if let Err(e) = another_br {
             assert!(e.kind() == io::ErrorKind::AlreadyExists);
@@ -1093,13 +1092,51 @@ mod tests {
     #[test]
     fn test_deletion() {
         let data_dir = tempfile::tempdir().unwrap();
-        let mut br = BitRustState::new(data_dir.path()).unwrap();
+        let cfg = ConfigBuilder::new(&data_dir).build();
+        let mut br = BitRustState::new(cfg).unwrap();
 
         br.put("foo".to_string(), "bar".to_string()).unwrap();
         assert!(br.get("foo").unwrap().unwrap() == "bar");
 
         br.delete("foo").unwrap();
         assert!(br.get("foo").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_active_file_sealing() {
+        // we expect the active file to be sealed once it reaches 1kB
+        let sz_limit = 1_000;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let cfg = ConfigBuilder::new(&data_dir)
+                  .max_file_fize_bytes(sz_limit)
+                  .build();
+
+        let mut br = BitRust::open(cfg).unwrap();
+
+        let key = String::from("somekey");
+        let value = String::from("somevalue");
+        for _ in 0..1000 {
+            br.put(key.clone(), value.clone()).unwrap();
+        }
+
+        let num_data_files = fs::read_dir(&data_dir)
+                                .unwrap()
+                                .map(|entry| entry.unwrap())
+                                //.filter(|entry| entry.path().extension())
+                                .filter_map(|entry| {
+                                    entry.path()
+                                        .extension()
+                                        .and_then(OsStr::to_str)
+                                        .map(|s| s.ends_with(".data"))
+                                        .map(Option::from)
+                                        .unwrap_or(None)
+                                })
+                                .count();
+
+        // we can do better here by computing about how many 1kb files will
+        // be needed to store 1000 identical entries somekey => somevalue.
+        assert!(num_data_files > 1);
     }
 
     #[bench]

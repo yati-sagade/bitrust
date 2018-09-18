@@ -4,12 +4,14 @@ extern crate tempfile;
 use std::collections::HashMap;
 use bitrust::BitRustState;
 use bitrust::util::rand_str;
+use bitrust::ConfigBuilder;
 
 
 #[test]
 fn test_model_based_load_store() {
     let data_dir = tempfile::tempdir().unwrap();
-    let mut br = BitRustState::new(data_dir.path()).unwrap();
+    let cfg = ConfigBuilder::new(&data_dir).build();
+    let mut br = BitRustState::new(cfg).unwrap();
     let mut model = HashMap::new();
 
     for _ in 0..1000 {
