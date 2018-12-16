@@ -12,7 +12,10 @@ extern crate regex;
 #[macro_use]
 extern crate lazy_static;
 
+use std::thread;
+
 pub mod util;
+mod locking;
 mod lockfile;
 mod config;
 
@@ -74,7 +77,6 @@ type FileID = u16;
 type FileMap = HashMap<FileID, PathBuf>;
 
 pub const BITRUST_TOMBSTONE_STR: &'static str = "<bitrust_tombstone>";
-
 
 // The datadir is a folder on the filesystem where we store our datafiles and
 // hintfiles. This data structure maps a given file id to a tuple that contains
@@ -271,7 +273,6 @@ impl BitRustState {
         fs::create_dir_all(config.datadir())?;
 
         let data_dir = config.datadir().to_path_buf();
-        let lockfile_path = data_dir.join(".lock");
 
         // If the following fails, all it means is that we have a file at our
         // lockfile location that we did not create. We don't care at this
@@ -281,7 +282,7 @@ impl BitRustState {
         // returned object goes out of scope. Since we move it into the
         // returned BitRustState, this means the lock lives as long as the returned
         // BitRustState lives.
-        let lockfile = get_process_lockfile(lockfile_path)?;
+        let lockfile = locking::acquire(&data_dir, locking::LockType::Write)?;
 
         debug!("Obtained data directory lock");
 
@@ -350,7 +351,18 @@ impl BitRustState {
         self.active_file.tell()
     }
 
+    // XXX: Partial merges, i.e., when we operate only on a subset of the
+    // datafiles, is not implemented yet. It is important because if the
+    // merge process gets a random error from the OS when opening/reading
+    // one of the data files, the merge can still continue with the other
+    // files, degrading into a partial merge. It differs from a total merge
+    // mostly in the handling of tombstone values. In a partial merge, when
+    // a key is seen with a tombstone, one can not just drop it, as there
+    // might be a newer file that contains a non-tombstone value for the
+    // key.
     pub fn merge(&mut self) -> io::Result<()> {
+        // Try to get a merge-lock on the active directory.
+        // Go through the files in ascending order of ids
         Ok(())
     }
 
@@ -862,14 +874,6 @@ where
         })
 }
 
-fn get_process_lockfile<P>(path: P) -> io::Result<lockfile::LockFile>
-where
-    P: AsRef<Path>,
-{
-    let our_pid_str = process::id().to_string();
-    lockfile::LockFile::new(path, Some(our_pid_str.as_bytes()))
-}
-
 pub struct BitRust {
     state: BitRustState,
     running: Arc<atomic::AtomicBool>,
@@ -914,6 +918,14 @@ impl BitRust {
     }
 
     pub fn merge(&mut self) -> io::Result<()> {
+        // XXX: The merge in bitcask has provisions for a lot of corner cases, and does a bunch of
+        // things that I don't quite understand the reasoning behind. For example, there is
+        // a partial merge mode, wherein only a subset of files on disk are merged. In that case,
+        // it becomes important to "forward merge" a tombstone -- if we simply drop an entry when
+        // we see a tombstone during a partial merge, we might later see a stale value (older than
+        // the tombstone we saw) coming back as we merge an *older* file. This situation will not
+        // arise when doing a full merge in ascending order of file age. We do not support partial
+        // merges yet for simplicity.
         debug_timeit!("merge" => {
             self.state.merge()
         })
@@ -1109,8 +1121,8 @@ mod tests {
 
         let data_dir = tempfile::tempdir().unwrap();
         let cfg = ConfigBuilder::new(&data_dir)
-                  .max_file_fize_bytes(sz_limit)
-                  .build();
+            .max_file_fize_bytes(sz_limit)
+            .build();
 
         let mut br = BitRust::open(cfg).unwrap();
 
