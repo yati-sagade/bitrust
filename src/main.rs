@@ -94,6 +94,7 @@ fn cmd_loop(br: &mut BitRust) -> io::Result<()> {
         ("del", "del KEY\n  Delete given KEY"),
         ("lst", "lst\n  List all keys"),
         ("exit", "exit/quit\n  Exit this shell"),
+        ("_merge", "merge data files (blocking)"),
         ("help", "help/?\n  Show this message"),
     ];
 
@@ -138,6 +139,8 @@ fn cmd_loop(br: &mut BitRust) -> io::Result<()> {
                 continue;
             }
             println!("{:?}", br.delete(cmd[1]));
+        } else if cmd[0] == "_merge" {
+            br.merge()?;
         } else if cmd[0] == "exit" || cmd[0] == "quit" {
             break;
         } else {

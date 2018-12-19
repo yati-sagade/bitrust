@@ -18,6 +18,7 @@ pub mod util;
 mod locking;
 mod lockfile;
 mod config;
+mod common;
 
 
 use std::collections::HashMap;
@@ -33,9 +34,9 @@ use std::sync::atomic;
 
 use bytes::{BytesMut, BufMut, IntoBuf, Buf};
 use byteorder::{ReadBytesExt, BigEndian};
-use regex::Regex;
 
 pub use config::*;
+pub use common::{FileID, BITRUST_TOMBSTONE_STR};
 
 macro_rules! debug_timeit {
     ( $name:expr => $b:block ) => {{
@@ -49,47 +50,7 @@ macro_rules! debug_timeit {
     }};
 }
 
-// In bitcask, a DataFile contains records the actual key and value with some
-// metadata, encoded in a binary format. Hintfiles are written when a multiple
-// data files are merged together into one data file, and are essentially
-// indexes into those files. They deliberately contain very similary information
-// to the in-memory keydir data structure. The goal of a hintfile is to allow
-// fast reconstruction of the keydir when recovering.
-enum FileKind {
-    DataFile,
-    HintFile,
-}
-
-// We'll just stick to the convention that *.data are datafiles, and *.hint
-// are hintfiles.
-impl FileKind {
-    fn from_path<P: AsRef<Path>>(path: P) -> Option<FileKind> {
-        let ext = path.as_ref().extension()?.to_str()?;
-        match ext {
-            "data" => Some(FileKind::DataFile),
-            "hint" => Some(FileKind::HintFile),
-            _ => None,
-        }
-    }
-}
-
-type FileID = u16;
 type FileMap = HashMap<FileID, PathBuf>;
-
-pub const BITRUST_TOMBSTONE_STR: &'static str = "<bitrust_tombstone>";
-
-// The datadir is a folder on the filesystem where we store our datafiles and
-// hintfiles. This data structure maps a given file id to a tuple that contains
-// the path to the corresponding active file and the hint file, respectively.
-//
-// It only serves as a container when initializing the in-memory keydir.
-//
-// Note that it is an error to have a hint file without a corresponding data
-// file, even though we represent both here using an Option<PathBuf>. This is
-// done so we can scan through the datadir to build the DataDirContents
-// structure, during which we might find a hint file before the corresponding
-// data file.
-type DataDirContents = HashMap<FileID, (Option<PathBuf>, Option<PathBuf>)>;
 
 // The keydir is the main in-memory lookup table that bitcask uses, and
 // KeyDirEntry is an entry in that table (which is keyed by a String key, see
@@ -131,7 +92,10 @@ impl KeyDirEntry {
 // Keydirs are updated after each write.
 #[derive(Debug)]
 pub struct KeyDir {
+    /// mapping from a key to its keydir entry
     entries: HashMap<String, KeyDirEntry>,
+
+    /// mapping from file id to its path on disk
     file_map: FileMap,
 }
 
@@ -177,7 +141,7 @@ impl ActiveFile {
 
         let read_handle = OpenOptions::new().read(true).create(false).open(&path)?;
 
-        let file_id = file_id_from_path(&path);
+        let file_id = util::file_id_from_path(&path);
 
         let active_file = ActiveFile {
             write_handle,
@@ -229,7 +193,7 @@ struct InactiveFile {
 impl InactiveFile {
     fn new(path: PathBuf) -> io::Result<InactiveFile> {
         let read_handle = OpenOptions::new().read(true).create(false).open(&path)?;
-        let id = file_id_from_path(&path);
+        let id = util::file_id_from_path(&path);
         Ok(InactiveFile {
             read_handle: read_handle,
             name: path,
@@ -292,7 +256,7 @@ impl BitRustState {
         // hint file is optional, but cannot exist without a corresponding data
         // file (because hint files just contain pointers into the respective
         // data files)
-        let data_and_hint_files = get_data_and_hint_files(&data_dir)?;
+        let data_and_hint_files = util::get_data_and_hint_files(&data_dir)?;
 
         debug!(
             "Got {} data/hint file entries from {:?}",
@@ -351,6 +315,25 @@ impl BitRustState {
         self.active_file.tell()
     }
 
+    /// Returns a vector of `(file_id, path_to_file)` tuples, sorted ascending
+    /// by `file_id`.
+    fn get_files_for_merging(&self) -> Vec<(FileID, PathBuf)> {
+        let mut files_to_merge: Vec<(FileID, PathBuf)> = self.inactive_files
+            .keys()
+            .cloned()
+            .map(|id| {
+                let file_path = self.keydir.file_map.get(&id).expect(
+                    "Could not find file in the map! This is bad",
+                );
+                (id, file_path.clone())
+            })
+            .collect();
+
+        // Sort the above tuples by file id
+        files_to_merge.sort_by(|a, b| a.0.cmp(&b.0));
+        files_to_merge
+    }
+
     // XXX: Partial merges, i.e., when we operate only on a subset of the
     // datafiles, is not implemented yet. It is important because if the
     // merge process gets a random error from the OS when opening/reading
@@ -363,6 +346,32 @@ impl BitRustState {
     pub fn merge(&mut self) -> io::Result<()> {
         // Try to get a merge-lock on the active directory.
         // Go through the files in ascending order of ids
+        let merge_lockfile = locking::acquire(&self.config.datadir(), locking::LockType::Merge)?;
+
+        debug!("Acquired merge lockfile");
+
+        // Open all the mergefiles and fail early if we cannot open any.
+        // This is where a partial merge would have proceeded with the files we
+        // could open (see the note above).
+
+        let merge_files = {
+            let files_to_merge = self.get_files_for_merging();
+            debug!("Going to merge these files: {:?}", &files_to_merge);
+
+            let mut merge_files = Vec::new();
+            for (id, file_path) in files_to_merge.into_iter() {
+                // TODO: partial merges even if we fail to open some files.
+                let merge_file = InactiveFile::new(file_path)?;
+                merge_files.push(merge_file);
+            }
+            merge_files
+        };
+
+        // Read records sequentially from the file.
+        // If record.key does not exist in our keydir, move on.
+        // If record.key exists, but
+
+
         Ok(())
     }
 
@@ -525,7 +534,6 @@ impl BitRustState {
 }
 
 fn should_seal_active_data(active_file: &mut ActiveFile, config: &Config) -> io::Result<bool> {
-    // XXX: Read from config instead of hardcoding to 16MiB
     active_file.tell().map(
         |size| size > config.max_file_fize_bytes(),
     )
@@ -555,8 +563,7 @@ fn maybe_seal_active_data(
     // Ultimately we want to close the current active file and start
     // writing to a new one. The pointers into the old file should still
     // be active.
-    let will_seal = should_seal_active_data(active_file, config)?;
-    if will_seal {
+    if should_seal_active_data(active_file, config)? {
         debug!("Active file is too big, sealing");
         let old_active_file = {
             // XXX: ensure there are no conflicts
@@ -575,8 +582,7 @@ fn maybe_seal_active_data(
     }
 }
 
-
-fn build_key_dir(dd_contents: DataDirContents) -> io::Result<KeyDir> {
+fn build_key_dir(dd_contents: util::DataDirContents) -> io::Result<KeyDir> {
     info!("Making keydir");
 
     // First sort the data and hint files by file_id ascending so we process
@@ -786,93 +792,6 @@ where
     Ok(Some(new_offset))
 }
 
-fn is_data_or_hint_file<P>(path: P) -> bool
-where
-    P: AsRef<Path>,
-{
-    lazy_static! {
-        static ref RE: Regex = Regex::new(r"^[0-9]+\.(?:data|hint)$").unwrap();
-    }
-    let maybe_file_name_str = path.as_ref()
-                                  .file_name()
-                                  .and_then(|s| s.to_str()) // OsStr -> &str
-                                  ;
-    if let Some(file_name_str) = maybe_file_name_str {
-        RE.is_match(file_name_str)
-    } else {
-        false
-    }
-}
-
-
-// Returns a HashMap from FileId to (DataFile, HintFile). HintFile can be absent
-// when a DataFile is there, but the reverse should never happen, and this
-// function panics in that case.
-fn get_data_and_hint_files<P>(data_dir: P) -> io::Result<DataDirContents>
-where
-    P: AsRef<Path>,
-{
-    let mut retmap = DataDirContents::new();
-    for entry in fs::read_dir(data_dir)? {
-        let file_path = entry.expect("Error reading data directory").path();
-
-        if !is_data_or_hint_file(&file_path) {
-            continue;
-        }
-
-        let file_id = file_id_from_path(&file_path);
-        match FileKind::from_path(&file_path) {
-            // XXX: both arms are almost identical except for which element
-            // (0 or 1) of the tuple to insert/modify.
-            Some(FileKind::DataFile) => {
-                //data_files.insert(file_id, file_path);
-                retmap
-                    .entry(file_id)
-                    .and_modify(|v: &mut (Option<PathBuf>, Option<PathBuf>)| {
-                        v.0 = Some(file_path.clone());
-                    })
-                    .or_insert((Some(file_path.clone()), None));
-            }
-            Some(FileKind::HintFile) => {
-                retmap
-                    .entry(file_id)
-                    .and_modify(|v: &mut (Option<PathBuf>, Option<PathBuf>)| {
-                        v.1 = Some(file_path.clone());
-                    })
-                    .or_insert((None, Some(file_path.clone())));
-            }
-            _ => {}
-        }
-    }
-    for (file_id, (data_file, hint_file)) in &retmap {
-        match (data_file, hint_file) {
-            (None, Some(hint_file)) => {
-                panic!("Hint file {:?} found when data file was absent", hint_file)
-            }
-            (None, None) => panic!("No data AND hint file for file id {}!", file_id),
-            _ => {}
-        }
-    }
-    Ok(retmap)
-}
-
-fn file_id_from_path<P>(path: P) -> u16
-where
-    P: AsRef<Path>,
-{
-    let path = path.as_ref();
-    path.file_stem()
-        .unwrap_or_else(|| panic!("Could not get stem path for {:?}", path))
-        .to_str()
-        .unwrap_or_else(|| panic!("Could not convert {:?} OsStr to &str", path))
-        .parse::<u16>()
-        .unwrap_or_else(|_| {
-            panic!(
-                "Non integral file id (or something that does not fit u16): {:?}",
-                path
-            )
-        })
-}
 
 pub struct BitRust {
     state: BitRustState,
@@ -918,14 +837,6 @@ impl BitRust {
     }
 
     pub fn merge(&mut self) -> io::Result<()> {
-        // XXX: The merge in bitcask has provisions for a lot of corner cases, and does a bunch of
-        // things that I don't quite understand the reasoning behind. For example, there is
-        // a partial merge mode, wherein only a subset of files on disk are merged. In that case,
-        // it becomes important to "forward merge" a tombstone -- if we simply drop an entry when
-        // we see a tombstone during a partial merge, we might later see a stale value (older than
-        // the tombstone we saw) coming back as we merge an *older* file. This situation will not
-        // arise when doing a full merge in ascending order of file age. We do not support partial
-        // merges yet for simplicity.
         debug_timeit!("merge" => {
             self.state.merge()
         })
@@ -953,52 +864,6 @@ mod tests {
     use std::io::Cursor;
     use super::*;
     use std::ffi::OsStr;
-
-    #[test]
-    fn test_file_id_from_path() {
-        let path = PathBuf::from("/some/path/to/42.data");
-        let file_id = file_id_from_path(&path);
-        assert!(file_id == 42);
-
-        let path = PathBuf::from("/some/path/to/42.hint");
-        let file_id = file_id_from_path(&path);
-        assert!(file_id == 42);
-    }
-
-    #[test]
-    fn test_get_data_and_hint_files() {
-        let data_dir = tempfile::tempdir().unwrap();
-        for idx in 0..10 {
-            let data_file_path = data_dir.path().join(&format!("{}.data", idx));
-            let _f = File::create(&data_file_path).unwrap();
-            if idx < 5 {
-                let hint_file_path = data_dir.path().join(&format!("{}.hint", idx));
-                let _f = File::create(&hint_file_path).unwrap();
-            }
-            let spurious_file_path = data_dir.path().join(&format!("{}.spurious", idx));
-            let _f = File::create(&spurious_file_path).unwrap();
-        }
-        let spurious_file_path = data_dir.path().join("10.spurious");
-        let _f = File::create(&spurious_file_path).unwrap();
-
-        let mut dd_contents = get_data_and_hint_files(data_dir.path()).unwrap();
-
-        for idx in 0..10 {
-            let (data_file, hint_file) = dd_contents.remove(&idx).unwrap_or_else(|| {
-                panic!("Missing file_id {}", idx);
-            });
-            let data_file = data_file.unwrap_or_else(|| panic!("data file {} not found", idx));
-
-            assert!(data_file == data_dir.path().join(&format!("{}.data", idx)));
-
-            if idx < 5 {
-                let hint_file = hint_file.unwrap_or_else(|| panic!("hint file {} not found", idx));
-                assert!(hint_file == data_dir.path().join(&format!("{}.hint", idx)));
-            }
-        }
-        assert!(dd_contents.len() == 0);
-    }
-
 
     // The following two tests statically include reference data from ../aux,
     // along with "guide" files, which tell us what to expect once the binary
