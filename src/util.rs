@@ -50,20 +50,24 @@ where
         })
 }
 
+#[derive(Debug)]
 pub struct FileIDGen {
     next_id: FileID,
 }
 
 impl FileIDGen {
-    pub fn new<P>(data_dir: P) -> io::Result<()>
-    where
-        P: AsRef<Path>,
-    {
-        Ok(())
+    pub fn new(next_id: FileID) -> FileIDGen {
+        FileIDGen { next_id }
+    }
+
+    pub fn take_next_id(&mut self) -> FileID {
+        let ret = self.next_id;
+        self.next_id += 1;
+        ret
     }
 }
 
-/// The datadir is a folder on the filesystem where we store our datafiles and
+/// The datadir is a folder on_di the filesystem where we store our datafiles and
 /// hintfiles. This data structure maps a given file id to a tuple that contains
 /// the path to the corresponding active file and the hint file, respectively.
 ///

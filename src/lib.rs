@@ -36,7 +36,7 @@ use bytes::{BytesMut, BufMut, IntoBuf, Buf};
 use byteorder::{ReadBytesExt, BigEndian};
 
 pub use config::*;
-pub use common::{FileID, BITRUST_TOMBSTONE_STR};
+pub use common::{FileID, BITRUST_TOMBSTONE_STR, BitrustOperation};
 
 macro_rules! debug_timeit {
     ( $name:expr => $b:block ) => {{
@@ -229,6 +229,7 @@ pub struct BitRustState {
     rwlock: Arc<RwLock<()>>,
 
     config: Config,
+    data_file_id_gen: util::FileIDGen,
 }
 
 impl BitRustState {
@@ -246,7 +247,7 @@ impl BitRustState {
         // returned object goes out of scope. Since we move it into the
         // returned BitRustState, this means the lock lives as long as the returned
         // BitRustState lives.
-        let lockfile = locking::acquire(&data_dir, locking::LockType::Write)?;
+        let lockfile = locking::acquire(&data_dir, BitrustOperation::Write)?;
 
         debug!("Obtained data directory lock");
 
@@ -283,7 +284,7 @@ impl BitRustState {
         // We should probably build the keydir and the `active_file` and
         // `inactive_file` fields together, but it is just simpler to first
         // build the keydir and then do another pass to build the other fields.
-        let keydir = build_key_dir(data_and_hint_files.clone())?;
+        let keydir = build_keydir(data_and_hint_files.clone())?;
 
         let active_file_name = active_file_path(&data_dir)?;
         debug!("Using active file {:?}", &active_file_name);
@@ -298,6 +299,8 @@ impl BitRustState {
             }
         }
 
+        let active_file_id = active_file.id;
+
         let bitrust = BitRustState {
             keydir,
             config: config,
@@ -305,6 +308,7 @@ impl BitRustState {
             active_file: active_file,
             lockfile,
             rwlock: Arc::new(RwLock::new(())),
+            data_file_id_gen: util::FileIDGen::new(active_file_id + 1)
         };
 
         Ok(bitrust)
@@ -322,9 +326,11 @@ impl BitRustState {
             .keys()
             .cloned()
             .map(|id| {
-                let file_path = self.keydir.file_map.get(&id).expect(
-                    "Could not find file in the map! This is bad",
-                );
+                let file_path = self.keydir.file_map.get(&id).expect(&format!(
+                    "Could not find file id {} in the map! This is bad: {:?}",
+                    id,
+                    &self.keydir.file_map,
+                ));
                 (id, file_path.clone())
             })
             .collect();
@@ -346,7 +352,8 @@ impl BitRustState {
     pub fn merge(&mut self) -> io::Result<()> {
         // Try to get a merge-lock on the active directory.
         // Go through the files in ascending order of ids
-        let merge_lockfile = locking::acquire(&self.config.datadir(), locking::LockType::Merge)?;
+        let merge_lockfile = locking::acquire(&self.config.datadir(),
+                                              BitrustOperation::Merge)?;
 
         debug!("Acquired merge lockfile");
 
@@ -354,7 +361,7 @@ impl BitRustState {
         // This is where a partial merge would have proceeded with the files we
         // could open (see the note above).
 
-        let merge_files = {
+        let merge_files: Vec<InactiveFile> = {
             let files_to_merge = self.get_files_for_merging();
             debug!("Going to merge these files: {:?}", &files_to_merge);
 
@@ -440,8 +447,17 @@ impl BitRustState {
         // This is also why maybe_seal_active_data() is a function accepting
         // our fields mutably rather than a method on &mut self.
         let inactive_files = &mut self.inactive_files;
-        maybe_seal_active_data(&mut self.active_file, &self.config)?
+        let keydir = &mut self.keydir;
+        let active_file = &mut self.active_file;
+        let config = &self.config;
+
+        maybe_seal_active_data(active_file, config)?
             .map(|inactive_file| {
+
+                add_data_file_to_keydir_filemap(keydir,
+                                                active_file.id,
+                                                &active_file.name);
+
                 inactive_files.insert(inactive_file.id, inactive_file)
             });
 
@@ -582,7 +598,7 @@ fn maybe_seal_active_data(
     }
 }
 
-fn build_key_dir(dd_contents: util::DataDirContents) -> io::Result<KeyDir> {
+fn build_keydir(dd_contents: util::DataDirContents) -> io::Result<KeyDir> {
     info!("Making keydir");
 
     // First sort the data and hint files by file_id ascending so we process
@@ -597,8 +613,15 @@ fn build_key_dir(dd_contents: util::DataDirContents) -> io::Result<KeyDir> {
         // If we have the hint file, we prefer reading it since it is almost
         // a direct on-disk representation of the keydir.
         if let Some(hint_file) = hint_file {
-            let hint_file = File::open(&hint_file)?;
-            read_hint_file_into_keydir(file_id, &hint_file, &mut keydir)?;
+            let hint_file_handle = File::open(&hint_file)?;
+
+            let data_file = data_file
+                .expect("Hint file {:?} present, but no corresponding data file");
+
+            read_hint_file_into_keydir(file_id,
+                                       hint_file,
+                                       data_file,
+                                       &mut keydir)?;
         } else {
             let data_file = data_file.unwrap_or_else(|| {
                 panic!(
@@ -606,23 +629,49 @@ fn build_key_dir(dd_contents: util::DataDirContents) -> io::Result<KeyDir> {
                     file_id
                 )
             });
-            let data_file = File::open(&data_file)?;
-            read_data_file_into_keydir(file_id, &data_file, &mut keydir)?;
+            let data_file_handle = File::open(&data_file)?;
+            read_data_file_into_keydir(file_id,
+                                       data_file,
+                                       &mut keydir)?;
         }
     }
     Ok(keydir)
 }
 
-fn read_hint_file_into_keydir<R>(
+fn add_data_file_to_keydir_filemap<P>(keydir: &mut KeyDir,
+                                      file_id: FileID,
+                                      data_file_path: P)
+where P: AsRef<Path>
+{
+    if let Some(ref existing_data_file_path) = keydir.file_map.get(&file_id) {
+        panic!("Unexpected path {:?} found for file id {} in the filemap",
+               existing_data_file_path,
+               file_id);
+    }
+    keydir.file_map.insert(file_id, data_file_path.as_ref().to_path_buf());
+}
+
+fn read_hint_file_into_keydir<P>(
     file_id: FileID,
-    mut hint_file: R,
-    key_dir: &mut KeyDir,
+    hint_file_path: P,
+    data_file_path: P,
+    keydir: &mut KeyDir,
 ) -> io::Result<()>
 where
-    R: Read,
+    P: AsRef<Path>,
 {
+
+
+    add_data_file_to_keydir_filemap(keydir, file_id, data_file_path);
+
+    let mut hint_file_handle = File::open(hint_file_path.as_ref())?;
+
     // We receive a Some(_) when EOF hasn't been reached.
-    while let Some(_) = read_hint_file_record(file_id, &mut hint_file, key_dir)? {}
+    while let Some(_) = read_hint_file_record(file_id,
+                                              &mut hint_file_handle,
+                                              keydir)?
+    { }
+
     Ok(())
 }
 
@@ -641,7 +690,7 @@ where
 fn read_hint_file_record<R>(
     file_id: FileID,
     hint_file: R,
-    key_dir: &mut KeyDir,
+    keydir: &mut KeyDir,
 ) -> io::Result<Option<()>>
 where
     R: Read,
@@ -691,25 +740,28 @@ where
     };
 
     let entry = KeyDirEntry::new(file_id, val_size, val_pos, timestamp);
-    key_dir.insert(key, entry);
+    keydir.insert(key, entry);
 
     Ok(Some(()))
 }
 
-
-fn read_data_file_into_keydir<R>(
+fn read_data_file_into_keydir<P>(
     file_id: FileID,
-    mut data_file: R,
-    key_dir: &mut KeyDir,
+    data_file_path: P,
+    keydir: &mut KeyDir,
 ) -> io::Result<()>
 where
-    R: Read,
+    P: AsRef<Path>,
 {
+    let mut data_file_handle = File::open(&data_file_path)?;
+
+    add_data_file_to_keydir_filemap(keydir, file_id, data_file_path);
+
     let mut offset = 0;
     while let Some(new_offset) = read_data_file_record_into_keydir(
         file_id,
-        &mut data_file,
-        key_dir,
+        &mut data_file_handle,
+        keydir,
         offset,
     )?
     {
@@ -721,7 +773,7 @@ where
 fn read_data_file_record_into_keydir<R>(
     file_id: FileID,
     data_file: R,
-    key_dir: &mut KeyDir,
+    keydir: &mut KeyDir,
     offset: u64,
 ) -> io::Result<Option<u64>>
 where
@@ -787,7 +839,7 @@ where
     new_offset += u64::from(val_size);
 
     let entry = KeyDirEntry::new(file_id, (new_offset - offset) as u16, offset, timestamp);
-    key_dir.insert(key, entry);
+    keydir.insert(key, entry);
 
     Ok(Some(new_offset))
 }
@@ -873,10 +925,30 @@ mod tests {
     fn test_read_hintfile_into_keydir() {
 
         let hint_bytes = Vec::from(&include_bytes!("../aux/test_hintfile.hint")[..]);
-        let hintfile_reader = Cursor::new(hint_bytes);
+
+        let data_dir = tempfile::tempdir().unwrap();
+
+        let hint_file_path = data_dir.as_ref().join("0.hint");
+        let data_file_path = data_dir.as_ref().join("0.data");
+
+        {
+            let mut file = OpenOptions::new()
+                                .create(true)
+                                .write(true)
+                                .open(&hint_file_path)
+                                .unwrap();
+            file.write_all(&hint_bytes[..]).unwrap();
+        }
+
         let mut keydir = KeyDir::new();
 
-        read_hint_file_into_keydir(0, hintfile_reader, &mut keydir).unwrap();
+        read_hint_file_into_keydir(0,
+                                   &hint_file_path,
+                                   &data_file_path,
+                                   &mut keydir).unwrap();
+
+        assert!(keydir.file_map.len() == 1);
+        assert!(keydir.file_map.get(&0).map_or(false, |path| *path == data_file_path));
 
         let hintfile_guide_str = include_str!("../aux/test_hintfile.hint.guide");
 
@@ -909,10 +981,25 @@ mod tests {
     fn test_read_datafile_into_keydir() {
 
         let data_bytes = Vec::from(&include_bytes!("../aux/test_datafile.data")[..]);
-        let datafile_reader = Cursor::new(data_bytes);
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let data_file_path = data_dir.as_ref().join("0.data");
+
+        {
+            let mut file = OpenOptions::new()
+                                .create(true)
+                                .write(true)
+                                .open(&data_file_path)
+                                .unwrap();
+            file.write_all(&data_bytes[..]).unwrap();
+        }
+
         let mut keydir = KeyDir::new();
 
-        read_data_file_into_keydir(0, datafile_reader, &mut keydir).unwrap();
+        read_data_file_into_keydir(0, &data_file_path, &mut keydir).unwrap();
+
+        assert!(keydir.file_map.len() == 1);
+        assert!(keydir.file_map.get(&0).map_or(false, |path| *path == data_file_path));
 
         let datafile_guide_str = include_str!("../aux/test_datafile.data.guide");
         let datafile_guide_lines = datafile_guide_str
@@ -1014,6 +1101,47 @@ mod tests {
         // we can do better here by computing about how many 1kb files will
         // be needed to store 1000 identical entries somekey => somevalue.
         assert!(num_data_files > 1);
+    }
+
+    #[test]
+    fn test_get_files_for_merging() {
+        let sz_limit = 1024; // bytes
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let cfg = ConfigBuilder::new(&data_dir)
+            .max_file_fize_bytes(sz_limit)
+            .build();
+
+        let mut br = BitRust::open(cfg).unwrap();
+
+        // This will take 32 bytes to store:
+        // what                 size in bytes
+        // ----------------------------------
+        // checksum                         4
+        // timestamp                        8
+        // keysize                          2
+        // valsize                          2
+        // key ("somekey")                  7
+        // val ("somevalue")                9 
+        // ----------------------------------
+        // total                           32
+
+        let key = String::from("somekey");
+        let value = String::from("somevalue");
+        let entry_sz: usize = 4 + 8 + 2 + 2 + key.len() + value.len();
+
+        let total_entries = 256;
+        let total_open_files = (total_entries as f64 /
+                                entry_sz as f64).ceil() as usize;
+
+        for _ in 0..total_entries {
+            br.put(key.clone(), value.clone()).unwrap();
+        }
+
+        let files_to_merge = br.state.get_files_for_merging();
+
+        assert!(files_to_merge.len() == total_open_files - 1);
+
     }
 
     #[bench]
