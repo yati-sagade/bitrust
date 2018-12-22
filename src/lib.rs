@@ -50,8 +50,6 @@ macro_rules! debug_timeit {
     }};
 }
 
-type FileMap = HashMap<FileID, PathBuf>;
-
 // The keydir is the main in-memory lookup table that bitcask uses, and
 // KeyDirEntry is an entry in that table (which is keyed by a String key, see
 // below). The KeyDirEntry for a given key tells us which file we need to look
@@ -95,15 +93,12 @@ pub struct KeyDir {
     /// mapping from a key to its keydir entry
     entries: HashMap<String, KeyDirEntry>,
 
-    /// mapping from file id to its path on disk
-    file_map: FileMap,
 }
 
 impl KeyDir {
     fn new() -> KeyDir {
         KeyDir {
             entries: HashMap::new(),
-            file_map: FileMap::new(),
         }
     }
 
@@ -222,7 +217,12 @@ impl Into<InactiveFile> for ActiveFile {
 pub struct BitRustState {
     keydir: KeyDir,
     active_file: ActiveFile,
+
     inactive_files: HashMap<FileID, InactiveFile>,
+
+    /// mapping from file id to its path on disk
+    file_map: HashMap<FileID, PathBuf>,
+
     lockfile: lockfile::LockFile,
     // A ghost lock object, used to hold R/W locks on the entire bitrust
     // instance.
@@ -265,7 +265,7 @@ impl BitRustState {
             &data_dir
         );
 
-        if data_and_hint_files.len() == 0 {
+        let (keydir, file_map) = if data_and_hint_files.len() == 0 {
             // We are starting from scratch, write the name of the active file
             // as 0.data.
             let ptr_path = active_file_pointer_path(&data_dir);
@@ -279,12 +279,19 @@ impl BitRustState {
                     "Garbled initial data file name?",
                 ),
             )?;
-        }
 
-        // We should probably build the keydir and the `active_file` and
-        // `inactive_file` fields together, but it is just simpler to first
-        // build the keydir and then do another pass to build the other fields.
-        let keydir = build_keydir(data_and_hint_files.clone())?;
+            let mut file_map: HashMap<FileID, PathBuf> = HashMap::new();
+            file_map.insert(0, data_dir.join("0.data"));
+
+            let keydir = KeyDir::new();
+
+            (keydir, file_map)
+        } else {
+            // We should probably build the keydir and the `active_file` and
+            // `inactive_file` fields together, but it is just simpler to first
+            // build the keydir and then do another pass to build the other fields.
+            build_keydir(data_and_hint_files.clone())?
+        };
 
         let active_file_name = active_file_path(&data_dir)?;
         debug!("Using active file {:?}", &active_file_name);
@@ -305,6 +312,7 @@ impl BitRustState {
             keydir,
             config: config,
             inactive_files: inactive_files,
+            file_map,
             active_file: active_file,
             lockfile,
             rwlock: Arc::new(RwLock::new(())),
@@ -326,10 +334,10 @@ impl BitRustState {
             .keys()
             .cloned()
             .map(|id| {
-                let file_path = self.keydir.file_map.get(&id).expect(&format!(
+                let file_path = self.file_map.get(&id).expect(&format!(
                     "Could not find file id {} in the map! This is bad: {:?}",
                     id,
-                    &self.keydir.file_map,
+                    &self.file_map,
                 ));
                 (id, file_path.clone())
             })
@@ -450,13 +458,15 @@ impl BitRustState {
         let keydir = &mut self.keydir;
         let active_file = &mut self.active_file;
         let config = &self.config;
+        let file_map = &mut self.file_map;
 
         maybe_seal_active_data(active_file, config)?
             .map(|inactive_file| {
 
-                add_data_file_to_keydir_filemap(keydir,
-                                                active_file.id,
-                                                &active_file.name);
+                // Add the new active file to the filemap
+                add_data_file_to_filemap(file_map,
+                                         active_file.id,
+                                         &active_file.name);
 
                 inactive_files.insert(inactive_file.id, inactive_file)
             });
@@ -598,7 +608,8 @@ fn maybe_seal_active_data(
     }
 }
 
-fn build_keydir(dd_contents: util::DataDirContents) -> io::Result<KeyDir> {
+fn build_keydir(dd_contents: util::DataDirContents)
+        -> io::Result<(KeyDir, HashMap<FileID, PathBuf>)> {
     info!("Making keydir");
 
     // First sort the data and hint files by file_id ascending so we process
@@ -608,47 +619,47 @@ fn build_keydir(dd_contents: util::DataDirContents) -> io::Result<KeyDir> {
     dd_entries.sort_by(|v1, v2| v1.0.cmp(&v2.0));
 
     let mut keydir = KeyDir::new();
+    let mut file_map = HashMap::new();
 
     for (file_id, (data_file, hint_file)) in dd_entries {
+        let data_file = data_file.unwrap_or_else(|| {
+            panic!(
+                "Expected datafile for file id {} not found when building keydir",
+                file_id
+            )
+        });
+
+        add_data_file_to_filemap(&mut file_map,
+                                 file_id,
+                                 &data_file);
+
         // If we have the hint file, we prefer reading it since it is almost
         // a direct on-disk representation of the keydir.
         if let Some(hint_file) = hint_file {
-            let hint_file_handle = File::open(&hint_file)?;
-
-            let data_file = data_file
-                .expect("Hint file {:?} present, but no corresponding data file");
-
             read_hint_file_into_keydir(file_id,
-                                       hint_file,
-                                       data_file,
+                                       &hint_file,
+                                       &data_file,
                                        &mut keydir)?;
         } else {
-            let data_file = data_file.unwrap_or_else(|| {
-                panic!(
-                    "Expected datafile for file id {} not found when building keydir",
-                    file_id
-                )
-            });
-            let data_file_handle = File::open(&data_file)?;
             read_data_file_into_keydir(file_id,
-                                       data_file,
+                                       &data_file,
                                        &mut keydir)?;
         }
     }
-    Ok(keydir)
+    Ok((keydir, file_map))
 }
 
-fn add_data_file_to_keydir_filemap<P>(keydir: &mut KeyDir,
-                                      file_id: FileID,
-                                      data_file_path: P)
+fn add_data_file_to_filemap<P>(file_map: &mut HashMap<FileID, PathBuf>,
+                               file_id: FileID,
+                               data_file_path: P)
 where P: AsRef<Path>
 {
-    if let Some(ref existing_data_file_path) = keydir.file_map.get(&file_id) {
+    if let Some(ref existing_data_file_path) = file_map.get(&file_id) {
         panic!("Unexpected path {:?} found for file id {} in the filemap",
                existing_data_file_path,
                file_id);
     }
-    keydir.file_map.insert(file_id, data_file_path.as_ref().to_path_buf());
+    file_map.insert(file_id, data_file_path.as_ref().to_path_buf());
 }
 
 fn read_hint_file_into_keydir<P>(
@@ -660,9 +671,6 @@ fn read_hint_file_into_keydir<P>(
 where
     P: AsRef<Path>,
 {
-
-
-    add_data_file_to_keydir_filemap(keydir, file_id, data_file_path);
 
     let mut hint_file_handle = File::open(hint_file_path.as_ref())?;
 
@@ -754,8 +762,6 @@ where
     P: AsRef<Path>,
 {
     let mut data_file_handle = File::open(&data_file_path)?;
-
-    add_data_file_to_keydir_filemap(keydir, file_id, data_file_path);
 
     let mut offset = 0;
     while let Some(new_offset) = read_data_file_record_into_keydir(
@@ -947,9 +953,6 @@ mod tests {
                                    &data_file_path,
                                    &mut keydir).unwrap();
 
-        assert!(keydir.file_map.len() == 1);
-        assert!(keydir.file_map.get(&0).map_or(false, |path| *path == data_file_path));
-
         let hintfile_guide_str = include_str!("../aux/test_hintfile.hint.guide");
 
         let hintfile_guide_lines = hintfile_guide_str
@@ -997,9 +1000,6 @@ mod tests {
         let mut keydir = KeyDir::new();
 
         read_data_file_into_keydir(0, &data_file_path, &mut keydir).unwrap();
-
-        assert!(keydir.file_map.len() == 1);
-        assert!(keydir.file_map.get(&0).map_or(false, |path| *path == data_file_path));
 
         let datafile_guide_str = include_str!("../aux/test_datafile.data.guide");
         let datafile_guide_lines = datafile_guide_str
