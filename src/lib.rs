@@ -907,10 +907,7 @@ fn active_file_pointer_path<P: AsRef<Path>>(data_dir: P) -> PathBuf {
 
 fn active_file_path<P: AsRef<Path>>(data_dir: P) -> io::Result<PathBuf> {
     let ptr_path = active_file_pointer_path(data_dir);
-    let mut fp = File::open(ptr_path)?;
-    let mut buf = String::new();
-    fp.read_to_string(&mut buf)?;
-    Ok(PathBuf::from(buf))
+    util::read_from_file(ptr_path).map(PathBuf::from)
 }
 
 #[cfg(test)]
@@ -1067,8 +1064,8 @@ mod tests {
     }
 
     #[test]
-    fn test_active_file_sealing() {
-        // we expect the active file to be sealed once it reaches 1kB
+    fn test_bitrust_state_evolution() {
+
         let sz_limit = 1_000;
 
         let data_dir = tempfile::tempdir().unwrap();
@@ -1080,27 +1077,89 @@ mod tests {
 
         let key = String::from("somekey");
         let value = String::from("somevalue");
-        for _ in 0..1000 {
+
+        let entry_sz = 4 // checksum
+                     + 8 // timestamp
+                     + 2 // key size
+                     + 2 // val size
+                     + key.as_bytes().len()
+                     + value.as_bytes().len();
+
+        let num_entries = 1000;
+
+        for _ in 0..num_entries {
             br.put(key.clone(), value.clone()).unwrap();
         }
 
-        let num_data_files = fs::read_dir(&data_dir)
+        let expected_num_data_files = (num_entries as f64
+                                       / entry_sz as f64).ceil() as usize;
+
+        let all_files = fs::read_dir(&data_dir)
+                            .unwrap()
+                            .map(|entry| entry.unwrap().path())
+                            .collect::<Vec<_>>();
+
+        let data_files = fs::read_dir(&data_dir)
                                 .unwrap()
                                 .map(|entry| entry.unwrap())
                                 //.filter(|entry| entry.path().extension())
                                 .filter_map(|entry| {
-                                    entry.path()
-                                        .extension()
-                                        .and_then(OsStr::to_str)
-                                        .map(|s| s.ends_with(".data"))
-                                        .map(Option::from)
-                                        .unwrap_or(None)
-                                })
-                                .count();
+                                    let is_data_file =
+                                        entry.path()
+                                             .extension()
+                                             .and_then(OsStr::to_str)
+                                             .map_or(false, |s| s == "data");
 
-        // we can do better here by computing about how many 1kb files will
-        // be needed to store 1000 identical entries somekey => somevalue.
-        assert!(num_data_files > 1);
+                                    if is_data_file {
+                                        Some(data_dir.as_ref().join(entry.path()))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<_>>();
+
+        let active_file_pointer_path = active_file_pointer_path(&data_dir);
+
+        let persisted_active_file_name = PathBuf::from(
+            util::read_from_file(active_file_pointer_path).unwrap()
+        );
+
+        assert!(persisted_active_file_name == br.state.active_file.name);
+
+        assert!(data_files.len() == expected_num_data_files,
+                format!("Expected {} data files, found {}",
+                        expected_num_data_files,
+                        data_files.len()));
+
+        assert!(br.state.file_map.len() == data_files.len());
+
+        for data_file in data_files.into_iter() {
+            let file_id = util::file_id_from_path(&data_file);
+            assert!(*br.state.file_map.get(&file_id).unwrap() == data_file);
+        }
+
+
+    }
+
+    #[test]
+    fn test_bitrust_state_init_from_scratch() {
+
+        // we expect the active file to be sealed once it reaches 1kB
+        let sz_limit = 1_000;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let cfg = ConfigBuilder::new(data_dir.as_ref())
+            .max_file_fize_bytes(sz_limit)
+            .build();
+
+        let mut br = BitRust::open(cfg).unwrap();
+
+        assert!(br.state.active_file.name == data_dir.as_ref().join("0.data"));
+        assert!(br.state.keydir.entries.len() == 0);
+        assert!(br.state.inactive_files.len() == 0);
+
+        assert!(br.state.file_map.len() == 1);
+        assert!(*br.state.file_map.get(&0).unwrap() == data_dir.as_ref().join("0.data"));
     }
 
     #[test]
@@ -1122,7 +1181,7 @@ mod tests {
         // keysize                          2
         // valsize                          2
         // key ("somekey")                  7
-        // val ("somevalue")                9 
+        // val ("somevalue")                9
         // ----------------------------------
         // total                           32
 
@@ -1141,6 +1200,34 @@ mod tests {
         let files_to_merge = br.state.get_files_for_merging();
 
         assert!(files_to_merge.len() == total_open_files - 1);
+
+    }
+
+    #[test]
+    fn test_overflow_puts() {
+        // Test that when we overflow into multiple data files, the store still
+        // returns expected values.
+
+        let sz_limit = 100; // small size limit so we always overflow.
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let cfg = ConfigBuilder::new(&data_dir)
+            .max_file_fize_bytes(sz_limit)
+            .build();
+
+        let mut br = BitRust::open(cfg).unwrap();
+
+        let key_vals = (0..1000)
+                        .map(|_| (util::rand_str(), util::rand_str()))
+                        .collect::<Vec<_>>();
+
+        for (key, val) in key_vals.iter().cloned() {
+            br.put(key, val).unwrap();
+        }
+
+        for (key, val) in key_vals.into_iter() {
+            assert!(br.get(&key).unwrap() == Some(val));
+        }
 
     }
 

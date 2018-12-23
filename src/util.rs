@@ -1,7 +1,7 @@
 use std::mem;
-use std::io::{self, Write};
+use std::io::{self, Write, Read};
 use std::path::{Path, PathBuf};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, OpenOptions, File};
 use crc::crc32;
 use rand::{self, Rng};
 use regex::Regex;
@@ -25,6 +25,15 @@ where
     let mut file = OpenOptions::new().create(true).write(true).open(path)?;
     let buf = buf.as_ref().bytes().collect::<Vec<_>>();
     file.write_all(&buf[..])
+}
+
+pub fn read_from_file<P>(path: P) -> io::Result<String>
+where P: AsRef<Path>
+{
+    let mut fp = File::open(path)?;
+    let mut buf = String::new();
+    fp.read_to_string(&mut buf)?;
+    Ok(buf)
 }
 
 pub fn rand_str() -> String {
