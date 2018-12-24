@@ -85,7 +85,15 @@ if __name__ == '__main__':
 
 
             guide_out.write(",".join(str(field) for field in
-                                (timestamp, len(key), len(val), offset, key, val)))
+                                (
+                                    timestamp,
+                                    0, #file id
+                                    len(key),
+                                    len(val),
+                                    offset,
+                                    key,
+                                    val
+                                )))
             guide_out.write("\n")
 
             timestamp += 1
