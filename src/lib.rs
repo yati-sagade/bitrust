@@ -24,7 +24,7 @@ mod common;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use std::path::{PathBuf, Path};
-use std::io;
+use std::io::{self, Cursor};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write, Seek, SeekFrom};
 use std::process;
@@ -32,7 +32,7 @@ use std::mem;
 use std::sync::{RwLock, Arc};
 use std::sync::atomic;
 
-use bytes::{BytesMut, BufMut, IntoBuf, Buf};
+use bytes::{BytesMut, Bytes, BufMut, IntoBuf, Buf};
 use byteorder::{ReadBytesExt, BigEndian};
 
 pub use config::*;
@@ -170,6 +170,11 @@ trait ReadableFile {
         fp.seek(SeekFrom::Start(offset_from_start))?;
         fp.read_exact(bytes)
     }
+
+    fn read_exact_from_current_offset(&mut self, bytes: &mut [u8]) -> io::Result<()> {
+        let fp = self.file()?;
+        fp.read_exact(bytes)
+    }
 }
 
 impl ReadableFile for ActiveFile {
@@ -177,6 +182,23 @@ impl ReadableFile for ActiveFile {
         Ok(&mut self.read_handle)
     }
 }
+
+trait DataFile: ReadableFile {
+
+    fn read_record(&mut self, offset: usize, record_size: usize)
+            -> io::Result<BitRustDataRecord>
+    {
+        let mut read_buf = vec![0u8; record_size as usize];
+        ReadableFile::read_exact(self, offset as u64, &mut read_buf)?;
+
+        BitRustDataRecord::from_bytes(Cursor::new(read_buf))
+    }
+}
+
+impl DataFile for ActiveFile { }
+impl DataFile for InactiveFile { }
+
+
 
 #[derive(Debug)]
 struct InactiveFile {
@@ -210,6 +232,154 @@ impl Into<InactiveFile> for ActiveFile {
             name: self.name,
             id: self.id,
         }
+    }
+}
+
+struct BitRustDataRecord {
+    timestamp: u64,
+    key_bytes: Vec<u8>,
+    val_bytes: Vec<u8>,
+}
+
+impl BitRustDataRecord {
+    pub fn new(timestamp: u64, key_bytes: Vec<u8>, val_bytes: Vec<u8>) -> BitRustDataRecord {
+        BitRustDataRecord { timestamp, key_bytes, val_bytes }
+    }
+
+    pub fn header_size() -> usize {
+           mem::size_of::<u32>()  // checksum
+         + mem::size_of::<u64>()  // timestamp
+         + mem::size_of::<u16>()  // key size
+         + mem::size_of::<u16>()  // value size
+    }
+
+    pub fn as_bytes(&self) -> Bytes {
+
+        let payload_size = BitRustDataRecord::header_size()
+                         + self.key_bytes.len()        // key payload
+                         + self.val_bytes.len()        // value payload
+                         ;
+
+        let mut payload = BytesMut::with_capacity(payload_size);
+
+        // We split to after 32 bits so we can write the data first, and then
+        // compute the checksum of this data to put in the initial 32 bits.
+        let mut payload_head = payload.split_to(4);
+
+        payload.put_u64_be(self.timestamp);
+        payload.put_u16_be(self.key_bytes.len() as u16);
+        payload.put_u16_be(self.val_bytes.len() as u16);
+        payload.put(&self.key_bytes);
+        payload.put(&self.val_bytes);
+
+        let checksum = util::checksum_crc32(&payload);
+        payload_head.put_u32_be(checksum);
+
+        // Now payload_head contains all of the record we want to write out,(
+        // including the checksum.
+        payload_head.unsplit(payload);
+
+        payload_head.into()
+    }
+
+    pub fn into_bytes(self) -> Bytes {
+
+        let payload_size = BitRustDataRecord::header_size()
+                         + self.key_bytes.len()        // key payload
+                         + self.val_bytes.len()        // value payload
+                         ;
+
+        let mut payload = BytesMut::with_capacity(payload_size);
+
+        // We split to after 32 bits so we can write the data first, and then
+        // compute the checksum of this data to put in the initial 32 bits.
+        let mut payload_head = payload.split_to(4);
+
+        payload.put_u64_be(self.timestamp);
+        payload.put_u16_be(self.key_bytes.len() as u16);
+        payload.put_u16_be(self.val_bytes.len() as u16);
+        payload.put(self.key_bytes);
+        payload.put(self.val_bytes);
+
+        let checksum = util::checksum_crc32(&payload);
+        payload_head.put_u32_be(checksum);
+
+        // Now payload_head contains all of the record we want to write out,(
+        // including the checksum.
+        payload_head.unsplit(payload);
+
+        payload_head.into()
+    }
+
+    pub fn from_bytes<T: Buf>(mut buf: T) -> io::Result<BitRustDataRecord> {
+        let checksum = buf.get_u32_be();
+        {
+            let buf_bytes = Buf::bytes(&buf);
+            let computed_checksum = util::checksum_crc32(buf_bytes);
+            if computed_checksum != checksum {
+                let msg = format!("Data integrity check failed! \
+                                   record checksum={}, computed checksum={}",
+                                  checksum,
+                                  computed_checksum);
+                let err = io::Error::new(io::ErrorKind::InvalidData, msg);
+                return Err(err)
+            }
+        }
+
+        let timestamp = buf.get_u64_be();
+        let key_size = buf.get_u16_be();
+        let val_size = buf.get_u16_be();
+
+        // We don't care about the key, so just move ahead
+        let (key_bytes, val_bytes) = Buf::bytes(&buf).split_at(key_size as usize);
+
+        if val_bytes.len() != val_size as usize {
+            let msg = format!("Expected {} bytes for the value, but read {}",
+                               val_size,
+                               val_bytes.len());
+            let err = io::Error::new(io::ErrorKind::InvalidData, msg);
+        }
+
+        Ok(BitRustDataRecord::new(timestamp, key_bytes.to_vec(), val_bytes.to_vec()))
+    }
+
+    // TODO: Do checksum validation
+    pub fn next_from_file<R: ReadableFile>(file: &mut R) -> io::Result<BitRustDataRecord> {
+        let (checksum, timestamp, key_size, val_size) = {
+            let mut header_bytes = vec![0; BitRustDataRecord::header_size()];
+            file.read_exact_from_current_offset(&mut header_bytes)?;
+
+            let mut start = 0;
+            let mut end = mem::size_of::<u32>();
+            let checksum = (&header_bytes[start..end]).read_u32::<BigEndian>()?;
+
+            start = end;
+            end += mem::size_of::<u64>();
+            let timestamp = (&header_bytes[start..end]).read_u64::<BigEndian>()?;
+
+            start = end;
+            end += mem::size_of::<u16>();
+            let key_size = (&header_bytes[start..end]).read_u16::<BigEndian>()?;
+
+            start = end;
+            end += mem::size_of::<u16>();
+            let val_size = (&header_bytes[start..end]).read_u16::<BigEndian>()?;
+
+            (checksum, timestamp, key_size, val_size)
+        };
+
+        let (key_bytes, val_bytes) = {
+            let mut buf = vec![0; key_size as usize + val_size as usize];
+
+            file.read_exact_from_current_offset(&mut buf)?;
+            let key_bytes = &buf[..key_size as usize];
+            let val_bytes = &buf[key_size as usize..];
+
+            // TODO: Avoid this clone
+            (key_bytes.to_vec(), val_bytes.to_vec())
+        };
+
+        Ok(BitRustDataRecord::new(timestamp, key_bytes, val_bytes))
     }
 }
 
@@ -292,6 +462,8 @@ impl BitRustState {
             // build the keydir and then do another pass to build the other fields.
             build_keydir(data_and_hint_files.clone())?
         };
+
+        debug!("keydir: {:?}", &keydir.entries);
 
         let active_file_name = active_file_path(&data_dir)?;
         debug!("Using active file {:?}", &active_file_name);
@@ -397,19 +569,6 @@ impl BitRustState {
         let key_bytes = key.clone().into_bytes();
         let val_bytes = value.into_bytes();
 
-        let payload_size = mem::size_of::<u32>()  // checksum
-                         + mem::size_of::<u64>()  // timestamp
-                         + mem::size_of::<u16>()  // key size
-                         + mem::size_of::<u16>()  // value size
-                         + key_bytes.len()        // key payload
-                         + val_bytes.len()        // value payload
-                         ;
-
-        let mut payload = BytesMut::with_capacity(payload_size);
-
-        // We split to after 32 bits so we can write the data first, and then
-        // computer the checksum of this data to put in the initial 32 bits.
-        let mut payload_head = payload.split_to(4);
 
         let timestamp_now = {
             let dur_since_unix_epoch = SystemTime::now().duration_since(UNIX_EPOCH).expect(
@@ -417,27 +576,19 @@ impl BitRustState {
             );
             dur_since_unix_epoch.as_secs()
         };
-        payload.put_u64_be(timestamp_now);
-        payload.put_u16_be(key_bytes.len() as u16);
-        payload.put_u16_be(val_bytes.len() as u16);
-        payload.put(key_bytes);
-        payload.put(val_bytes);
 
-        let checksum = util::checksum_crc32(&payload);
+        let record = BitRustDataRecord::new(timestamp_now,
+                                            key_bytes,
+                                            val_bytes);
 
-        payload_head.put_u32_be(checksum);
-
-        // Now payload_head contains all of the record we want to write out,(
-        // including the checksum.
-        payload_head.unsplit(payload);
-
-        let record_offset = self.active_file.append(&payload_head)?;
+        let record_bytes = record.into_bytes();
+        let record_offset = self.active_file.append(&record_bytes)?;
 
         self.keydir.insert(
             key,
             KeyDirEntry::new(
                 self.active_file.id,
-                payload_head.len() as u16,
+                record_bytes.len() as u16,
                 record_offset,
                 timestamp_now,
             ),
@@ -480,21 +631,12 @@ impl BitRustState {
 
         let entry = self.keydir.get(key);
         if let Some(entry) = entry {
-            // Read required bytes
-            let mut read_buf = vec![0u8; entry.record_size as usize];
-
-            debug!(
-                "Asking to read {} bytes from offset {}",
-                read_buf.len(),
-                entry.record_offset
-            );
-
-            if entry.file_id == self.active_file.id {
+            let record = if entry.file_id == self.active_file.id {
                 debug!("Fetching from active file (id {})", entry.file_id);
-                self.active_file.read_exact(
-                    entry.record_offset,
-                    &mut read_buf,
-                )?;
+                self.active_file.read_record(
+                    entry.record_offset as usize,
+                    entry.record_size as usize
+                )?
             } else {
                 // if the key is not present in the store, we won't reach here
                 // (`entry` would be None). Having an entry pointing to a file
@@ -506,36 +648,11 @@ impl BitRustState {
 "Got a request for inactive file id {}, but it was not loaded, this is really bad!",
                                         entry.file_id
                                     ));
-                file.read_exact(entry.record_offset, &mut read_buf)?;
-            }
+                file.read_record(entry.record_offset as usize,
+                                 entry.record_size as usize)?
+            };
 
-            debug!("Read {} bytes", read_buf.len());
-
-            // We use a BytesMut for the easy extractor methods for which
-            // we'd otherwise have to use mem::transmute or something directly.
-            let mut buf = BytesMut::from(read_buf).into_buf();
-
-            let checksum = buf.get_u32_be();
-            {
-                let buf_bytes = Buf::bytes(&buf);
-                let computed_checksum = util::checksum_crc32(buf_bytes);
-                if computed_checksum != checksum {
-                    panic!(
-                        "Data integrity check failed! record checksum={}, computed checksum={}",
-                        checksum,
-                        computed_checksum
-                    );
-                }
-            }
-            let _timestamp = buf.get_u64_be();
-            let key_size = buf.get_u16_be();
-            let _val_size = buf.get_u16_be();
-
-            // We don't care about the key, so just move ahead
-            buf.advance(key_size as usize);
-
-            // At this point, all we have in buf is the value bytes
-            let val = String::from_utf8(Buf::bytes(&buf).to_vec()).unwrap();
+            let val = String::from_utf8(record.val_bytes).unwrap();
 
             // Currently deletion and the application writing the tombstone
             // value directly are indistinguishable.
@@ -636,11 +753,13 @@ fn build_keydir(dd_contents: util::DataDirContents)
         // If we have the hint file, we prefer reading it since it is almost
         // a direct on-disk representation of the keydir.
         if let Some(hint_file) = hint_file {
+            debug!("Reading hint file for file id {}", file_id);
             read_hint_file_into_keydir(file_id,
                                        &hint_file,
                                        &data_file,
                                        &mut keydir)?;
         } else {
+            debug!("Reading data file id {}", file_id);
             read_data_file_into_keydir(file_id,
                                        &data_file,
                                        &mut keydir)?;
@@ -708,7 +827,7 @@ where
     let mut reader = hint_file;
 
     // Record format
-    // | tstamp (64) | ksz (16) | record_size (16) | record_offset (32) | key ($ksz) |
+    // | tstamp (64) | ksz (16) | record_size (16) | record_offset (64) | key ($ksz) |
 
     // To signal end of stream, we try to read the first field, the timestamp,
     // and return None if we cannot read anything. However, if we can read a
@@ -927,7 +1046,7 @@ mod tests {
     #[test]
     fn test_read_hintfile_into_keydir() {
 
-        let hint_bytes = Vec::from(&include_bytes!("../aux/test_hintfile.hint")[..]);
+        let hint_bytes = Vec::from(&include_bytes!("../aux/0.hint")[..]);
 
         let data_dir = tempfile::tempdir().unwrap();
 
@@ -950,7 +1069,7 @@ mod tests {
                                    &data_file_path,
                                    &mut keydir).unwrap();
 
-        let hintfile_guide_str = include_str!("../aux/test_hintfile.hint.guide");
+        let hintfile_guide_str = include_str!("../aux/0.guide");
 
         let hintfile_guide_lines = hintfile_guide_str
             .split("\n")
@@ -962,25 +1081,117 @@ mod tests {
             let fields = line.split(",").collect::<Vec<_>>();
 
             let timestamp = fields[0].parse::<u64>().unwrap();
-            let _key_size = fields[1].parse::<u16>().unwrap();
-            let val_size = fields[2].parse::<u16>().unwrap();
-            let offset = fields[3].parse::<u64>().unwrap();
-            let key = fields[4];
+            let file_id = fields[1].parse::<u64>().unwrap();
+            let key_size = fields[2].parse::<u16>().unwrap();
+            let val_size = fields[3].parse::<u16>().unwrap();
+            let offset = fields[4].parse::<u64>().unwrap();
+            let key = fields[5];
 
             let entry = keydir.entries.remove(key).unwrap();
 
             assert!(entry.file_id == 0);
-            assert!(entry.record_size == val_size);
+            assert!(entry.record_size as usize
+                    == BitRustDataRecord::header_size() as usize
+                     + val_size as usize
+                     + key_size as usize);
             assert!(entry.record_offset == offset);
             assert!(entry.timestamp == timestamp);
         }
         assert!(keydir.entries.len() == 0);
     }
 
+    /*
+    #[test]
+    fn test_bitrust_record_read_next_from_file() {
+
+        let data_bytes = Vec::from(&include_bytes!("../aux/0.data")[..]);
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let data_file_path = data_dir.as_ref().join("0.data");
+
+        {
+            let mut file = OpenOptions::new()
+                                .create(true)
+                                .write(true)
+                                .open(&data_file_path)
+                                .unwrap();
+            file.write_all(&data_bytes[..]).unwrap();
+        }
+
+        let datafile_guide_str = include_str!("../aux/0.guide");
+        let datafile_guide_lines = datafile_guide_str
+            .split("\n")
+            .filter(|line| line.len() > 0)
+            .collect::<Vec<_>>();
+
+        let records = include_str!("../aux/records.txt")
+                      .split("\n")
+                      .map(|line| line.split(",").collect::<Vec<_>>())
+                      .collect::<Vec<_>>();
+
+        let mut data_file = InactiveFile::new(data_file_path.clone()).unwrap();
+
+        for (idx, line) in datafile_guide_lines.iter().enumerate() {
+
+            let line = line.trim();
+            let fields = line.split(",").collect::<Vec<_>>();
+
+            let expected_key = fields[0];
+            let expected_timestamp = fields[4].parse::<u64>().unwrap();
+
+            let expected_key_ = records[idx][0];
+            let expected_val = records[idx][1];
+
+            let record = BitRustDataRecord::next_from_file(&mut data_file).unwrap();
+
+            assert!(record.key_bytes == expected_key.as_bytes(),
+                    "Read {:?}, expected {:?}",
+                    String::from_utf8(record.key_bytes).unwrap(),
+                    String::from_utf8(expected_key.as_bytes().to_vec()));
+            assert!(record.key_bytes == expected_key_.as_bytes());
+            assert!(record.val_bytes == expected_val.as_bytes());
+            assert!(record.timestamp == expected_timestamp);
+        }
+
+    }*/
+
+    struct GuideRecord {
+        timestamp: u64,
+        file_id: FileID,
+        key_size: u16,
+        val_size: u16,
+        offset: u64,
+        key: Vec<u8>,
+        val: Vec<u8>,
+    }
+
+    fn parse_guide_line(line: &str) -> GuideRecord {
+        let line = line.trim();
+        let fields = line.split(",").collect::<Vec<_>>();
+
+        let timestamp = fields[0].parse::<u64>().unwrap();
+        let file_id = fields[1].parse::<FileID>().unwrap();
+        let key_size = fields[2].parse::<u16>().unwrap();
+        let val_size = fields[3].parse::<u16>().unwrap();
+        let offset = fields[4].parse::<u64>().unwrap();
+        let key = fields[5];
+        let val = fields[6];
+
+        GuideRecord{
+            timestamp,
+            file_id,
+            key_size,
+            val_size,
+            offset,
+            key: key.as_bytes().to_vec(),
+            val: val.as_bytes().to_vec()
+        }
+    }
+
     #[test]
     fn test_read_datafile_into_keydir() {
 
-        let data_bytes = Vec::from(&include_bytes!("../aux/test_datafile.data")[..]);
+        let data_bytes = Vec::from(&include_bytes!("../aux/0.data")[..]);
 
         let data_dir = tempfile::tempdir().unwrap();
         let data_file_path = data_dir.as_ref().join("0.data");
@@ -998,29 +1209,31 @@ mod tests {
 
         read_data_file_into_keydir(0, &data_file_path, &mut keydir).unwrap();
 
-        let datafile_guide_str = include_str!("../aux/test_datafile.data.guide");
+        let datafile_guide_str = include_str!("../aux/0.guide");
         let datafile_guide_lines = datafile_guide_str
             .split("\n")
             .filter(|line| line.len() > 0)
             .collect::<Vec<_>>();
 
+        println!("keydir loaded as {:?}", &keydir.entries);
+
         for line in datafile_guide_lines {
-            let line = line.trim();
-            let fields = line.split(",").collect::<Vec<_>>();
 
-            let key = fields[0];
-            let file_id = fields[1].parse::<FileID>().unwrap();
-            let record_size = fields[2].parse::<u16>().unwrap();
-            let record_offset = fields[3].parse::<u64>().unwrap();
-            let timestamp = fields[4].parse::<u64>().unwrap();
+            let guide_entry = parse_guide_line(line);
 
-            let entry = keydir.entries.remove(key).unwrap();
+            let key = String::from_utf8(guide_entry.key.clone()).unwrap();
+            let val = String::from_utf8(guide_entry.val.clone()).unwrap();
 
-            assert!(file_id == 0);
-            assert!(entry.file_id == file_id);
-            assert!(entry.record_size == record_size);
-            assert!(entry.record_offset == record_offset);
-            assert!(entry.timestamp == timestamp);
+            let entry = keydir.entries.remove(&key).unwrap();
+
+            assert!(guide_entry.file_id == 0);
+            assert!(entry.file_id == guide_entry.file_id);
+            assert!(entry.record_size as usize ==
+                            BitRustDataRecord::header_size() as usize
+                                       + guide_entry.key_size as usize
+                                       + guide_entry.val_size as usize);
+            assert!(entry.record_offset == guide_entry.offset);
+            assert!(entry.timestamp == guide_entry.timestamp);
         }
         assert!(keydir.entries.len() == 0);
 
