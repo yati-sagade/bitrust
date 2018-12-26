@@ -1,3 +1,5 @@
+#![recursion_limit = "1024"]
+
 #![feature(test)]
 extern crate byteorder;
 extern crate bytes;
@@ -477,13 +479,15 @@ impl BitRustState {
 
             (keydir, file_map)
         } else {
+            debug!("Now building keydir with these files: {:?}",
+                   &data_and_hint_files);
             // We should probably build the keydir and the `active_file` and
             // `inactive_file` fields together, but it is just simpler to first
             // build the keydir and then do another pass to build the other fields.
             build_keydir(data_and_hint_files.clone())?
         };
 
-        debug!("keydir: {:?}", &keydir.entries);
+        debug!("Done building keydir: {:?}", &keydir.entries);
 
         let active_file_name = active_file_path(&data_dir)?;
         debug!("Using active file {:?}", &active_file_name);
@@ -510,6 +514,8 @@ impl BitRustState {
             rwlock: Arc::new(RwLock::new(())),
             data_file_id_gen: util::FileIDGen::new(active_file_id + 1)
         };
+
+        debug!("Returning from BitRustState::new");
 
         Ok(bitrust)
     }
@@ -1053,15 +1059,62 @@ fn active_file_path<P: AsRef<Path>>(data_dir: P) -> io::Result<PathBuf> {
 mod tests {
 
     extern crate tempfile;
+    extern crate simplelog;
+
+    use simplelog::{CombinedLogger, TermLogger, LevelFilter};
 
     use test::Bencher;
     use std::io::Cursor;
     use super::*;
     use std::ffi::OsStr;
 
-    // The following few tests statically include reference data from ../aux,
-    // along with "guide" files, which tell us what to expect once the binary
-    // data/hint files are loaded.
+    fn bytes_to_utf8_string(bytes: &[u8]) -> String {
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[derive(Debug)]
+    struct GuideRecord {
+        timestamp: u64,
+        file_id: FileID,
+        key_size: u16,
+        val_size: u16,
+        offset: u64,
+        key: Vec<u8>,
+        val: Vec<u8>,
+    }
+
+    fn parse_guide_line(line: &str) -> GuideRecord {
+        let fields = line.split(",").collect::<Vec<_>>();
+
+        let timestamp = fields[0].parse::<u64>().unwrap();
+        let file_id = fields[1].parse::<FileID>().unwrap();
+        let key_size = fields[2].parse::<u16>().unwrap();
+        let val_size = fields[3].parse::<u16>().unwrap();
+        let offset = fields[4].parse::<u64>().unwrap();
+        let key = fields[5];
+        let val = fields[6];
+
+        GuideRecord{
+            timestamp,
+            file_id,
+            key_size,
+            val_size,
+            offset,
+            key: key.as_bytes().to_vec(),
+            val: val.as_bytes().to_vec()
+        }
+    }
+
+    fn setup_logging() -> io::Result<()> {
+        CombinedLogger::init(vec![
+            TermLogger::new(
+                LevelFilter::Debug,
+                simplelog::Config::default()
+            ).unwrap(),
+        ]).expect("Error setting up logging");
+
+        Ok(())
+    }
 
     fn setup() -> (tempfile::TempDir, PathBuf, PathBuf, Vec<GuideRecord>) {
 
@@ -1089,6 +1142,18 @@ mod tests {
                                 .open(&data_file_path)
                                 .unwrap();
             file.write_all(&data_bytes[..]).unwrap();
+        }
+
+        {
+            let mut file = OpenOptions::new()
+                                .create(true)
+                                .write(true)
+                                .open(&data_dir.as_ref().join(".activefile"))
+                                .unwrap();
+            file.write_all(data_file_path
+                           .to_str()
+                           .unwrap()
+                           .as_bytes()).unwrap();
         }
 
         let guide_str = include_str!("../aux/0.guide");
@@ -1145,38 +1210,15 @@ mod tests {
     #[test]
     fn test_bitrust_record_read_next_from_file() {
 
-        let data_bytes = Vec::from(&include_bytes!("../aux/0.data")[..]);
-
-        let data_dir = tempfile::tempdir().unwrap();
-        let data_file_path = data_dir.as_ref().join("0.data");
-
-        {
-            let mut file = OpenOptions::new()
-                                .create(true)
-                                .write(true)
-                                .open(&data_file_path)
-                                .unwrap();
-            file.write_all(&data_bytes[..]).unwrap();
-        }
-
-        let datafile_guide_str = include_str!("../aux/0.guide");
-        let datafile_guide_lines = datafile_guide_str
-            .split("\n")
-            .filter(|line| line.len() > 0)
-            .collect::<Vec<_>>();
+        let (data_dir, hint_file_path, data_file_path, guide_records) = setup();
 
         let mut data_file = InactiveFile::new(data_file_path.clone()).unwrap();
 
-        for (idx, line) in datafile_guide_lines.iter().enumerate() {
-
-            let guide_record = parse_guide_line(&line);
+        for (idx, guide_record) in guide_records.iter().enumerate() {
 
             let record = BitRustDataRecord::next_from_file(&mut data_file)
                             .unwrap()
                             .unwrap();
-
-            println!("doing {}, {}, {:?}, {:?}",
-                     idx, &line, &guide_record, &record);
 
             assert!(record.timestamp == guide_record.timestamp);
 
@@ -1195,136 +1237,42 @@ mod tests {
                     &record.val_bytes);
 
         }
-
         // Reading past the end should return Ok(None), but only if there was no
         // partial read -- i.e., the file should exactly end at a record, and
         // should not have garbage trailing bytes at the end.
         assert!(BitRustDataRecord::next_from_file(&mut data_file).unwrap().is_none());
     }
 
-    fn bytes_to_utf8_string(bytes: &[u8]) -> String {
-        String::from_utf8(bytes.to_vec()).unwrap()
-    }
-
-    #[derive(Debug)]
-    struct GuideRecord {
-        timestamp: u64,
-        file_id: FileID,
-        key_size: u16,
-        val_size: u16,
-        offset: u64,
-        key: Vec<u8>,
-        val: Vec<u8>,
-    }
-
-    fn parse_guide_line(line: &str) -> GuideRecord {
-        let fields = line.split(",").collect::<Vec<_>>();
-
-        let timestamp = fields[0].parse::<u64>().unwrap();
-        let file_id = fields[1].parse::<FileID>().unwrap();
-        let key_size = fields[2].parse::<u16>().unwrap();
-        let val_size = fields[3].parse::<u16>().unwrap();
-        let offset = fields[4].parse::<u64>().unwrap();
-        let key = fields[5];
-        let val = fields[6];
-
-        GuideRecord{
-            timestamp,
-            file_id,
-            key_size,
-            val_size,
-            offset,
-            key: key.as_bytes().to_vec(),
-            val: val.as_bytes().to_vec()
-        }
-    }
 
     #[test]
     fn test_read_datafile_into_keydir() {
 
-        let data_bytes = Vec::from(&include_bytes!("../aux/0.data")[..]);
-
-        let data_dir = tempfile::tempdir().unwrap();
-        let data_file_path = data_dir.as_ref().join("0.data");
-
-        {
-            let mut file = OpenOptions::new()
-                                .create(true)
-                                .write(true)
-                                .open(&data_file_path)
-                                .unwrap();
-            file.write_all(&data_bytes[..]).unwrap();
-        }
+        let (data_dir, hint_file_path, data_file_path, guide_records) = setup();
 
         let mut keydir = KeyDir::new();
 
         read_data_file_into_keydir(0, &data_file_path, &mut keydir).unwrap();
 
-        let datafile_guide_str = include_str!("../aux/0.guide");
-        let datafile_guide_lines = datafile_guide_str
-            .split("\n")
-            .filter(|line| line.len() > 0)
-            .collect::<Vec<_>>();
-
         println!("keydir loaded as {:?}", &keydir.entries);
 
-        for line in datafile_guide_lines {
+        for guide_record in &guide_records {
 
-            let guide_entry = parse_guide_line(line);
-
-            let key = String::from_utf8(guide_entry.key.clone()).unwrap();
-            let val = String::from_utf8(guide_entry.val.clone()).unwrap();
+            let key = String::from_utf8(guide_record.key.clone()).unwrap();
+            let val = String::from_utf8(guide_record.val.clone()).unwrap();
 
             let entry = keydir.entries.remove(&key).unwrap();
 
-            assert!(guide_entry.file_id == 0);
-            assert!(entry.file_id == guide_entry.file_id);
+            assert!(guide_record.file_id == 0);
+            assert!(entry.file_id == guide_record.file_id);
             assert!(entry.record_size as usize ==
                             BitRustDataRecord::header_size() as usize
-                                       + guide_entry.key_size as usize
-                                       + guide_entry.val_size as usize);
-            assert!(entry.record_offset == guide_entry.offset);
-            assert!(entry.timestamp == guide_entry.timestamp);
+                                       + guide_record.key_size as usize
+                                       + guide_record.val_size as usize);
+            assert!(entry.record_offset == guide_record.offset);
+            assert!(entry.timestamp == guide_record.timestamp);
         }
         assert!(keydir.entries.len() == 0);
 
-    }
-
-    #[test]
-    fn test_creation() {
-        let data_dir = tempfile::tempdir().unwrap();
-        let cfg = ConfigBuilder::new(&data_dir).build();
-        let mut br = BitRustState::new(cfg).unwrap();
-
-        br.put("foo".to_string(), "bar".to_string()).unwrap();
-        let r = br.get("foo").unwrap().unwrap();
-        assert!(r == "bar");
-    }
-
-    #[test]
-    fn test_locking_of_data_dir() {
-        let data_dir = tempfile::tempdir().unwrap();
-        let cfg = ConfigBuilder::new(&data_dir).build();
-        let _br = BitRustState::new(cfg.clone()).unwrap();
-
-        let another_br = BitRustState::new(cfg);
-        assert!(another_br.is_err());
-        if let Err(e) = another_br {
-            assert!(e.kind() == io::ErrorKind::AlreadyExists);
-        }
-    }
-
-    #[test]
-    fn test_deletion() {
-        let data_dir = tempfile::tempdir().unwrap();
-        let cfg = ConfigBuilder::new(&data_dir).build();
-        let mut br = BitRustState::new(cfg).unwrap();
-
-        br.put("foo".to_string(), "bar".to_string()).unwrap();
-        assert!(br.get("foo").unwrap().unwrap() == "bar");
-
-        br.delete("foo").unwrap();
-        assert!(br.get("foo").unwrap().is_none());
     }
 
     #[test]
@@ -1495,6 +1443,46 @@ mod tests {
 
     }
 
+    #[test]
+    fn test_creation() {
+        //setup_logging();
+        let data_dir = tempfile::tempdir().unwrap();
+
+        let cfg = ConfigBuilder::new(&data_dir).build();
+        let mut br = BitRustState::new(cfg).unwrap();
+
+        br.put("foo".to_string(), "bar".to_string()).unwrap();
+        let r = br.get("foo").unwrap().unwrap();
+        assert!(r == "bar");
+    }
+
+    #[test]
+    fn test_locking_of_data_dir() {
+        let data_dir = tempfile::tempdir().unwrap();
+
+        let cfg = ConfigBuilder::new(&data_dir).build();
+        let _br = BitRustState::new(cfg.clone()).unwrap();
+
+        let another_br = BitRustState::new(cfg);
+        assert!(another_br.is_err());
+        if let Err(e) = another_br {
+            assert!(e.kind() == io::ErrorKind::AlreadyExists);
+        }
+    }
+
+    #[test]
+    fn test_deletion() {
+        let data_dir = tempfile::tempdir().unwrap();
+
+        let cfg = ConfigBuilder::new(&data_dir).build();
+        let mut br = BitRustState::new(cfg).unwrap();
+
+        br.put("foo".to_string(), "bar".to_string()).unwrap();
+        assert!(br.get("foo").unwrap().unwrap() == "bar");
+
+        br.delete("foo").unwrap();
+        assert!(br.get("foo").unwrap().is_none());
+    }
 
     #[bench]
     fn bench_put(b: &mut Bencher) {
