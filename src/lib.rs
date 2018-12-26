@@ -156,10 +156,6 @@ impl ActiveFile {
         debug!("Appended {} bytes to at offset {}", bytes.len(), offset);
         self.write_handle.write_all(bytes).map(|_| offset)
     }
-
-    fn tell(&mut self) -> io::Result<u64> {
-        self.write_handle.seek(SeekFrom::Current(0))
-    }
 }
 
 trait ReadableFile {
@@ -175,11 +171,22 @@ trait ReadableFile {
         let fp = self.file()?;
         fp.read_exact(bytes)
     }
+
+    fn tell(&mut self) -> io::Result<u64> {
+        let fp = self.file()?;
+        fp.seek(SeekFrom::Current(0))
+    }
 }
 
 impl ReadableFile for ActiveFile {
     fn file<'a>(&'a mut self) -> io::Result<&'a mut File> {
         Ok(&mut self.read_handle)
+    }
+
+    fn tell(&mut self) -> io::Result<u64> {
+        // the write handle is already at the end -- is there a seek still
+        // required?
+        self.write_handle.seek(SeekFrom::Current(0))
     }
 }
 
@@ -345,10 +352,22 @@ impl BitRustDataRecord {
     }
 
     // TODO: Do checksum validation
-    pub fn next_from_file<R: ReadableFile>(file: &mut R) -> io::Result<BitRustDataRecord> {
+    pub fn next_from_file<R: ReadableFile>(file: &mut R) ->
+            io::Result<Option<BitRustDataRecord>> {
         let (checksum, timestamp, key_size, val_size) = {
             let mut header_bytes = vec![0; BitRustDataRecord::header_size()];
-            file.read_exact_from_current_offset(&mut header_bytes)?;
+
+            let offset = file.tell()?;
+            let result = file.read_exact_from_current_offset(&mut header_bytes);
+
+            if let Err(e) = result {
+                return if e.kind() == io::ErrorKind::UnexpectedEof
+                        && offset == file.tell()? {
+                    Ok(None)
+                } else {
+                    Err(e)
+                };
+            }
 
             let mut start = 0;
             let mut end = mem::size_of::<u32>();
@@ -380,7 +399,7 @@ impl BitRustDataRecord {
             (key_bytes.to_vec(), val_bytes.to_vec())
         };
 
-        Ok(BitRustDataRecord::new(timestamp, key_bytes, val_bytes))
+        Ok(Some(BitRustDataRecord::new(timestamp, key_bytes, val_bytes)))
     }
 }
 
@@ -1040,14 +1059,14 @@ mod tests {
     use super::*;
     use std::ffi::OsStr;
 
-    // The following two tests statically include reference data from ../aux,
+    // The following few tests statically include reference data from ../aux,
     // along with "guide" files, which tell us what to expect once the binary
     // data/hint files are loaded.
 
-    #[test]
-    fn test_read_hintfile_into_keydir() {
+    fn setup() -> (tempfile::TempDir, PathBuf, PathBuf, Vec<GuideRecord>) {
 
         let hint_bytes = Vec::from(&include_bytes!("../aux/0.hint")[..]);
+        let data_bytes = Vec::from(&include_bytes!("../aux/0.data")[..]);
 
         let data_dir = tempfile::tempdir().unwrap();
 
@@ -1063,6 +1082,44 @@ mod tests {
             file.write_all(&hint_bytes[..]).unwrap();
         }
 
+        {
+            let mut file = OpenOptions::new()
+                                .create(true)
+                                .write(true)
+                                .open(&data_file_path)
+                                .unwrap();
+            file.write_all(&data_bytes[..]).unwrap();
+        }
+
+        let guide_str = include_str!("../aux/0.guide");
+        let guide_records = guide_str
+                            .split("\n")
+                            .filter(|line| line.len() > 0)
+                            .map(parse_guide_line)
+                            .collect::<Vec<_>>();
+
+        (data_dir, hint_file_path, data_file_path, guide_records)
+    }
+
+    #[test]
+    fn test_merge() {
+        let (data_dir, hint_file_path, data_file_path, guide_records) = setup();
+        let mut data_file = InactiveFile::new(data_file_path.clone()).unwrap();
+        loop {
+            let record = BitRustDataRecord::next_from_file(&mut data_file).unwrap();
+            if record.is_none() {
+                println!("EOF");
+                break;
+            }
+            println!("{:?}", record.unwrap());
+        }
+    }
+
+    #[test]
+    fn test_read_hintfile_into_keydir() {
+
+        let (data_dir, hint_file_path, data_file_path, guide_records) = setup();
+
         let mut keydir = KeyDir::new();
 
         read_hint_file_into_keydir(0,
@@ -1070,33 +1127,17 @@ mod tests {
                                    &data_file_path,
                                    &mut keydir).unwrap();
 
-        let hintfile_guide_str = include_str!("../aux/0.guide");
-
-        let hintfile_guide_lines = hintfile_guide_str
-            .split("\n")
-            .filter(|line| line.len() > 0)
-            .collect::<Vec<_>>();
-
-        for line in hintfile_guide_lines {
-            let line = line.trim();
-            let fields = line.split(",").collect::<Vec<_>>();
-
-            let timestamp = fields[0].parse::<u64>().unwrap();
-            let file_id = fields[1].parse::<u64>().unwrap();
-            let key_size = fields[2].parse::<u16>().unwrap();
-            let val_size = fields[3].parse::<u16>().unwrap();
-            let offset = fields[4].parse::<u64>().unwrap();
-            let key = fields[5];
-
-            let entry = keydir.entries.remove(key).unwrap();
+        for guide_record in &guide_records {
+            let key = bytes_to_utf8_string(&guide_record.key);
+            let entry = keydir.entries.remove(&key).unwrap();
 
             assert!(entry.file_id == 0);
             assert!(entry.record_size as usize
                     == BitRustDataRecord::header_size() as usize
-                     + val_size as usize
-                     + key_size as usize);
-            assert!(entry.record_offset == offset);
-            assert!(entry.timestamp == timestamp);
+                     + guide_record.val_size as usize
+                     + guide_record.key_size as usize);
+            assert!(entry.record_offset == guide_record.offset);
+            assert!(entry.timestamp == guide_record.timestamp);
         }
         assert!(keydir.entries.len() == 0);
     }
@@ -1130,7 +1171,12 @@ mod tests {
 
             let guide_record = parse_guide_line(&line);
 
-            let record = BitRustDataRecord::next_from_file(&mut data_file).unwrap();
+            let record = BitRustDataRecord::next_from_file(&mut data_file)
+                            .unwrap()
+                            .unwrap();
+
+            println!("doing {}, {}, {:?}, {:?}",
+                     idx, &line, &guide_record, &record);
 
             assert!(record.timestamp == guide_record.timestamp);
 
@@ -1150,12 +1196,17 @@ mod tests {
 
         }
 
+        // Reading past the end should return Ok(None), but only if there was no
+        // partial read -- i.e., the file should exactly end at a record, and
+        // should not have garbage trailing bytes at the end.
+        assert!(BitRustDataRecord::next_from_file(&mut data_file).unwrap().is_none());
     }
 
     fn bytes_to_utf8_string(bytes: &[u8]) -> String {
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
+    #[derive(Debug)]
     struct GuideRecord {
         timestamp: u64,
         file_id: FileID,
