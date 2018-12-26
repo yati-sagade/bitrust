@@ -235,6 +235,7 @@ impl Into<InactiveFile> for ActiveFile {
     }
 }
 
+#[derive(Debug, PartialEq)]
 struct BitRustDataRecord {
     timestamp: u64,
     key_bytes: Vec<u8>,
@@ -1100,7 +1101,6 @@ mod tests {
         assert!(keydir.entries.len() == 0);
     }
 
-    /*
     #[test]
     fn test_bitrust_record_read_next_from_file() {
 
@@ -1124,36 +1124,37 @@ mod tests {
             .filter(|line| line.len() > 0)
             .collect::<Vec<_>>();
 
-        let records = include_str!("../aux/records.txt")
-                      .split("\n")
-                      .map(|line| line.split(",").collect::<Vec<_>>())
-                      .collect::<Vec<_>>();
-
         let mut data_file = InactiveFile::new(data_file_path.clone()).unwrap();
 
         for (idx, line) in datafile_guide_lines.iter().enumerate() {
 
-            let line = line.trim();
-            let fields = line.split(",").collect::<Vec<_>>();
-
-            let expected_key = fields[0];
-            let expected_timestamp = fields[4].parse::<u64>().unwrap();
-
-            let expected_key_ = records[idx][0];
-            let expected_val = records[idx][1];
+            let guide_record = parse_guide_line(&line);
 
             let record = BitRustDataRecord::next_from_file(&mut data_file).unwrap();
 
-            assert!(record.key_bytes == expected_key.as_bytes(),
-                    "Read {:?}, expected {:?}",
-                    String::from_utf8(record.key_bytes).unwrap(),
-                    String::from_utf8(expected_key.as_bytes().to_vec()));
-            assert!(record.key_bytes == expected_key_.as_bytes());
-            assert!(record.val_bytes == expected_val.as_bytes());
-            assert!(record.timestamp == expected_timestamp);
+            assert!(record.timestamp == guide_record.timestamp);
+
+            assert!(record.key_bytes == guide_record.key,
+                    "Expected key '{}' ({:?}), but found '{}' ({:?})",
+                    bytes_to_utf8_string(&guide_record.key),
+                    &guide_record.key,
+                    bytes_to_utf8_string(&record.key_bytes),
+                    &record.key_bytes);
+
+            assert!(record.val_bytes == guide_record.val,
+                    "Expected value '{}' ({:?}), but found '{}' ({:?})",
+                    bytes_to_utf8_string(&guide_record.val),
+                    &guide_record.val,
+                    bytes_to_utf8_string(&record.val_bytes),
+                    &record.val_bytes);
+
         }
 
-    }*/
+    }
+
+    fn bytes_to_utf8_string(bytes: &[u8]) -> String {
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
 
     struct GuideRecord {
         timestamp: u64,
@@ -1166,7 +1167,6 @@ mod tests {
     }
 
     fn parse_guide_line(line: &str) -> GuideRecord {
-        let line = line.trim();
         let fields = line.split(",").collect::<Vec<_>>();
 
         let timestamp = fields[0].parse::<u64>().unwrap();
@@ -1443,6 +1443,7 @@ mod tests {
         }
 
     }
+
 
     #[bench]
     fn bench_put(b: &mut Bencher) {
