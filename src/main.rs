@@ -131,7 +131,11 @@ fn cmd_loop(br: &mut BitRust) -> io::Result<()> {
             println!("{:?}", br.get(key));
         } else if cmd[0] == "lst" {
             for key in br.keys() {
-                println!("{}", key);
+                if let Ok(key_str) = String::from_utf8(key.to_vec()) {
+                    println!("{}", key_str);
+                } else {
+                    println!("{:x?}", &key);
+                }
             }
         } else if cmd[0] == "del" {
             if cmd.len() != 2 {

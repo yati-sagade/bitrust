@@ -24,8 +24,8 @@ mod lockfile;
 mod config;
 mod common;
 mod errors;
+mod storage;
 
-pub use errors::*;
 
 
 use std::collections::HashMap;
@@ -42,8 +42,11 @@ use std::sync::atomic;
 use bytes::{BytesMut, Bytes, BufMut, IntoBuf, Buf};
 use byteorder::{ReadBytesExt, BigEndian};
 
+pub use errors::*;
 pub use config::*;
 pub use common::{FileID, BITRUST_TOMBSTONE_STR, BitrustOperation};
+
+use storage::ReadableFile;
 
 macro_rules! debug_timeit {
     ( $name:expr => $b:block ) => {{
@@ -98,7 +101,7 @@ impl KeyDirEntry {
 #[derive(Debug)]
 pub struct KeyDir {
     /// mapping from a key to its keydir entry
-    entries: HashMap<String, KeyDirEntry>,
+    entries: HashMap<Vec<u8>, KeyDirEntry>,
 
 }
 
@@ -109,11 +112,11 @@ impl KeyDir {
         }
     }
 
-    fn insert(&mut self, key: String, entry: KeyDirEntry) {
+    fn insert(&mut self, key: Vec<u8>, entry: KeyDirEntry) {
         self.entries.insert(key, entry);
     }
 
-    fn get<'a>(&'a self, key: &str) -> Option<&'a KeyDirEntry> {
+    fn get<'a>(&'a self, key: &[u8]) -> Option<&'a KeyDirEntry> {
         self.entries.get(key)
     }
 }
@@ -165,25 +168,6 @@ impl ActiveFile {
     }
 }
 
-trait ReadableFile {
-    fn file<'a>(&'a mut self) -> io::Result<&'a mut File>;
-
-    fn read_exact(&mut self, offset_from_start: u64, bytes: &mut [u8]) -> io::Result<()> {
-        let fp = self.file()?;
-        fp.seek(SeekFrom::Start(offset_from_start))?;
-        fp.read_exact(bytes)
-    }
-
-    fn read_exact_from_current_offset(&mut self, bytes: &mut [u8]) -> io::Result<()> {
-        let fp = self.file()?;
-        fp.read_exact(bytes)
-    }
-
-    fn tell(&mut self) -> io::Result<u64> {
-        let fp = self.file()?;
-        fp.seek(SeekFrom::Current(0))
-    }
-}
 
 impl ReadableFile for ActiveFile {
     fn file<'a>(&'a mut self) -> io::Result<&'a mut File> {
@@ -198,7 +182,6 @@ impl ReadableFile for ActiveFile {
 }
 
 trait DataFile: ReadableFile {
-
     fn read_record(&mut self, offset: usize, record_size: usize)
             -> io::Result<BitRustDataRecord>
     {
@@ -210,9 +193,8 @@ trait DataFile: ReadableFile {
 }
 
 impl DataFile for ActiveFile { }
+
 impl DataFile for InactiveFile { }
-
-
 
 #[derive(Debug)]
 struct InactiveFile {
@@ -588,7 +570,11 @@ impl BitRustState {
         // Read records sequentially from the file.
         // If record.key does not exist in our keydir, move on.
         // If record.key exists, but
-
+        for merge_file in merge_files.into_iter() {
+            merge_one_file(&mut self.keydir,
+                           &mut self.file_map,
+                           merge_file)?;
+        }
 
         Ok(())
     }
@@ -616,7 +602,7 @@ impl BitRustState {
         let record_offset = self.active_file.append(&record_bytes)?;
 
         self.keydir.insert(
-            key,
+            key.as_bytes().to_vec(),
             KeyDirEntry::new(
                 self.active_file.id,
                 record_bytes.len() as u16,
@@ -660,7 +646,7 @@ impl BitRustState {
 
         let _lock = self.rwlock.read().unwrap();
 
-        let entry = self.keydir.get(key);
+        let entry = self.keydir.get(key.as_bytes());
         if let Some(entry) = entry {
             let record = if entry.file_id == self.active_file.id {
                 debug!("Fetching from active file (id {})", entry.file_id);
@@ -701,9 +687,9 @@ impl BitRustState {
         self.put(key.to_string(), String::from(BITRUST_TOMBSTONE_STR))
     }
 
-    pub fn keys(&self) -> Vec<String> {
+    pub fn keys<'a>(&'a self) -> Vec<&'a [u8]> {
         let _lock = self.rwlock.read().unwrap();
-        self.keydir.entries.keys().cloned().collect()
+        self.keydir.entries.keys().map(|v| &v[..]).collect()
     }
 }
 
@@ -892,9 +878,7 @@ where
     let key = {
         let mut key_bytes = vec![0u8; key_size as usize];
         reader.read_exact(&mut key_bytes)?;
-        String::from_utf8(key_bytes.clone()).unwrap_or_else(|_| {
-            panic!("Could not read key as utf8. Bytes={:?}", key_bytes)
-        })
+        key_bytes
     };
 
     let entry = KeyDirEntry::new(file_id, val_size, val_pos, timestamp);
@@ -983,8 +967,9 @@ where
     let key = {
         let mut key_bytes = vec![0u8; key_size as usize];
         reader.read_exact(&mut key_bytes)?;
-        String::from_utf8(key_bytes).unwrap()
+        key_bytes
     };
+
     new_offset += u64::from(key_size);
 
     {
@@ -994,7 +979,10 @@ where
     }
     new_offset += u64::from(val_size);
 
-    let entry = KeyDirEntry::new(file_id, (new_offset - offset) as u16, offset, timestamp);
+    let entry = KeyDirEntry::new(file_id,
+                                 (new_offset - offset) as u16,
+                                 offset,
+                                 timestamp);
     keydir.insert(key, entry);
 
     Ok(Some(new_offset))
@@ -1038,7 +1026,7 @@ impl BitRust {
         })
     }
 
-    pub fn keys(&self) -> Vec<String> {
+    pub fn keys<'a>(&'a self) -> Vec<&'a [u8]> {
         debug_timeit!("keys" => {
             self.state.keys()
         })
@@ -1058,6 +1046,16 @@ fn active_file_pointer_path<P: AsRef<Path>>(data_dir: P) -> PathBuf {
 fn active_file_path<P: AsRef<Path>>(data_dir: P) -> io::Result<PathBuf> {
     let ptr_path = active_file_pointer_path(data_dir);
     util::read_from_file(ptr_path).map(PathBuf::from)
+}
+
+fn merge_one_file(keydir: &mut KeyDir,
+                  file_map: &mut HashMap<FileID, PathBuf>,
+                  mut merge_file: InactiveFile) -> io::Result<()>
+{
+    while let Some(record) = BitRustDataRecord::next_from_file(&mut merge_file)? {
+        debug!("Merging {:?}", &record);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1198,8 +1196,7 @@ mod tests {
                                    &mut keydir).unwrap();
 
         for guide_record in &guide_records {
-            let key = bytes_to_utf8_string(&guide_record.key);
-            let entry = keydir.entries.remove(&key).unwrap();
+            let entry = keydir.entries.remove(&guide_record.key).unwrap();
 
             assert!(entry.file_id == 0);
             assert!(entry.record_size as usize
@@ -1262,10 +1259,7 @@ mod tests {
 
         for guide_record in &guide_records {
 
-            let key = String::from_utf8(guide_record.key.clone()).unwrap();
-            let val = String::from_utf8(guide_record.val.clone()).unwrap();
-
-            let entry = keydir.entries.remove(&key).unwrap();
+            let entry = keydir.entries.remove(&guide_record.key).unwrap();
 
             assert!(guide_record.file_id == 0);
             assert!(entry.file_id == guide_record.file_id);
