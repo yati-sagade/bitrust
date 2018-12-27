@@ -10,13 +10,21 @@ import time
 import struct
 import binascii
 
+if sys.version_info.major < 3:
+    print('It is impossibly frustrating to get strings right in Python2, '
+          'please run with a friendly Python 3')
+    sys.exit(1)
+
 records = [
     ('fourty-two', '42'),
     ('three', '3'),
     ('one', '1'),
     ('four', '4'),
     ('something with space', ' '),
-    ('two', '2')
+    ('two', '2'),
+    ('\x00\x01\x5a\x99', '\x00\x00\x1a'),
+    ('text key', '\x00\x67'),
+    ('\x00\x67', 'text val'),
 ]
 
 def record_to_bytes(key_bytes, val_bytes, timestamp):
@@ -68,9 +76,10 @@ if __name__ == '__main__':
         offset = 0
 
         for key, val in records:
-            print('writing {}'.format((key, val)))
-            key_bytes = [ord(byte) for byte in key]
-            val_bytes = [ord(byte) for byte in val]
+            key_bytes = key.encode('utf-8')
+            val_bytes = val.encode('utf-8')
+
+            print('writing {}'.format((key_bytes, val_bytes)))
 
             data_bytes_size, data_bytes =\
                     record_to_bytes(key_bytes, val_bytes, timestamp)
@@ -83,18 +92,21 @@ if __name__ == '__main__':
                                                   offset)
             hint_out.write(hint_bytes)
 
+            guide_out.write(",".join(str(field) for field in [
+                timestamp,
+                0, # file id
+                len(key_bytes),
+                len(val_bytes),
+                offset,
+            ]).encode("utf8"))
 
-            guide_out.write(",".join(str(field) for field in
-                                (
-                                    timestamp,
-                                    0, #file id
-                                    len(key),
-                                    len(val),
-                                    offset,
-                                    key,
-                                    val
-                                )))
-            guide_out.write("\n")
+            guide_out.write(','.encode("utf8"))
+            guide_out.write(key_bytes)
+
+            guide_out.write(','.encode("utf8"))
+            guide_out.write(val_bytes)
+
+            guide_out.write("\n".encode("utf8"))
 
             timestamp += 1
 
