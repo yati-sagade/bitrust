@@ -13,6 +13,8 @@ extern crate simplelog;
 extern crate regex;
 #[macro_use]
 extern crate lazy_static;
+#[macro_use]
+extern crate error_chain;
 
 use std::thread;
 
@@ -21,6 +23,9 @@ mod locking;
 mod lockfile;
 mod config;
 mod common;
+mod errors;
+
+pub use errors::*;
 
 
 use std::collections::HashMap;
