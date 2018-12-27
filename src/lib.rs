@@ -183,10 +183,13 @@ impl ReadableFile for ActiveFile {
 
 trait DataFile: ReadableFile {
     fn read_record(&mut self, offset: usize, record_size: usize)
-            -> io::Result<BitRustDataRecord>
+            -> Result<BitRustDataRecord>
     {
         let mut read_buf = vec![0u8; record_size as usize];
-        ReadableFile::read_exact(self, offset as u64, &mut read_buf)?;
+        ReadableFile::read_exact(self, offset as u64, &mut read_buf)
+        .chain_err(|| format!("Error reading {} bytes at offset {}",
+                              record_size,
+                              offset))?;
 
         BitRustDataRecord::from_bytes(Cursor::new(read_buf))
     }
@@ -308,7 +311,7 @@ impl BitRustDataRecord {
         payload_head.into()
     }
 
-    pub fn from_bytes<T: Buf>(mut buf: T) -> io::Result<BitRustDataRecord> {
+    pub fn from_bytes<T: Buf>(mut buf: T) -> Result<BitRustDataRecord> {
         let checksum = buf.get_u32_be();
         {
             let buf_bytes = Buf::bytes(&buf);
@@ -318,8 +321,7 @@ impl BitRustDataRecord {
                                    record checksum={}, computed checksum={}",
                                   checksum,
                                   computed_checksum);
-                let err = io::Error::new(io::ErrorKind::InvalidData, msg);
-                return Err(err)
+                return Err(ErrorKind::InvalidData(msg).into())
             }
         }
 
@@ -334,7 +336,7 @@ impl BitRustDataRecord {
             let msg = format!("Expected {} bytes for the value, but read {}",
                                val_size,
                                val_bytes.len());
-            let err = io::Error::new(io::ErrorKind::InvalidData, msg);
+            return Err(ErrorKind::InvalidData(msg).into());
         }
 
         Ok(BitRustDataRecord::new(timestamp, key_bytes.to_vec(), val_bytes.to_vec()))
@@ -627,30 +629,25 @@ impl BitRustState {
         Ok(())
     }
 
-    pub fn put(&mut self, key: String, value: String) -> io::Result<()> {
+    pub fn put(&mut self, key: Vec<u8>, val: Vec<u8>) -> Result<()> {
 
         let _lock = self.rwlock.write().unwrap();
 
-        let key_bytes = key.clone().into_bytes();
-        let val_bytes = value.into_bytes();
-
-
         let timestamp_now = {
-            let dur_since_unix_epoch = SystemTime::now().duration_since(UNIX_EPOCH).expect(
-                "Time drift!",
-            );
+            let dur_since_unix_epoch = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .chain_err(|| "Time drift!")?;
             dur_since_unix_epoch.as_secs()
         };
 
-        let record = BitRustDataRecord::new(timestamp_now,
-                                            key_bytes,
-                                            val_bytes);
+        let record = BitRustDataRecord::new(timestamp_now, key.clone(), val);
 
         let record_bytes = record.into_bytes();
-        let record_offset = self.active_file.append(&record_bytes)?;
+        let record_offset = self.active_file.append(&record_bytes)
+            .chain_err(|| "Failed to write record to active file")?;
 
         self.keydir.insert(
-            key.as_bytes().to_vec(),
+            key,
             KeyDirEntry::new(
                 self.active_file.id,
                 record_bytes.len() as u16,
@@ -661,7 +658,8 @@ impl BitRustState {
 
         debug!(
             "After this write, active file is {} bytes",
-            self.active_file.tell()?
+            self.active_file.tell()
+                .chain_err(|| "Failed to ftell() active file to get current offset")?
         );
 
         // Borrowing the field directly is needed here since self cannot be
@@ -690,49 +688,52 @@ impl BitRustState {
         Ok(())
     }
 
-    pub fn get(&mut self, key: &str) -> io::Result<Option<String>> {
+    pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
 
         let _lock = self.rwlock.read().unwrap();
 
-        let entry = self.keydir.get(key.as_bytes());
+        let entry = self.keydir.get(key);
         if let Some(entry) = entry {
             let record = if entry.file_id == self.active_file.id {
                 debug!("Fetching from active file (id {})", entry.file_id);
                 self.active_file.read_record(
                     entry.record_offset as usize,
                     entry.record_size as usize
-                )?
+                )
+                .chain_err(|| format!("Failed to read record from active file ({:?})",
+                                      &self.active_file.name))?
             } else {
                 // if the key is not present in the store, we won't reach here
                 // (`entry` would be None). Having an entry pointing to a file
                 // we don't know about is bad.
                 debug!("Fetching from inactive file id {}", entry.file_id);
-                let mut file = self.inactive_files
-                                   .get_mut(&entry.file_id)
-                                   .unwrap_or_else(|| panic!(
-"Got a request for inactive file id {}, but it was not loaded, this is really bad!",
-                                        entry.file_id
-                                    ));
-                file.read_record(entry.record_offset as usize,
-                                 entry.record_size as usize)?
-            };
 
-            let val = String::from_utf8(record.val_bytes).unwrap();
+                let mut file = self.inactive_files
+                   .get_mut(&entry.file_id)
+                   .ok_or(format!("Got a request for inactive file id {}, but \
+                                   it was not loaded, this is really bad!",
+                                  entry.file_id))?;
+
+                file.read_record(entry.record_offset as usize,
+                                 entry.record_size as usize)
+                    .chain_err(|| format!("Failed to read record from inactive\
+                                           file ({:?})", &file.name))?
+            };
 
             // Currently deletion and the application writing the tombstone
             // value directly are indistinguishable.
-            if val.as_str() == BITRUST_TOMBSTONE_STR {
+            if record.val_bytes == BITRUST_TOMBSTONE_STR {
                 Ok(None)
             } else {
-                Ok(Some(val))
+                Ok(Some(record.val_bytes))
             }
         } else {
             Ok(None)
         }
     }
 
-    pub fn delete(&mut self, key: &str) -> io::Result<()> {
-        self.put(key.to_string(), String::from(BITRUST_TOMBSTONE_STR))
+    pub fn delete(&mut self, key: &[u8]) -> Result<()> {
+        self.put(key.to_vec(), BITRUST_TOMBSTONE_STR.to_vec())
     }
 
     pub fn keys<'a>(&'a self) -> Vec<&'a [u8]> {
@@ -741,13 +742,13 @@ impl BitRustState {
     }
 }
 
-fn should_seal_active_data(active_file: &mut ActiveFile, config: &Config) -> io::Result<bool> {
+fn should_seal_active_data(active_file: &mut ActiveFile, config: &Config) -> Result<bool> {
     active_file.tell().map(
         |size| size > config.max_file_fize_bytes(),
-    )
+    ).chain_err(|| "Failed to find size of active file by ftelling it")
 }
 
-fn update_active_file_id(id: FileID, config: &Config) -> io::Result<PathBuf> {
+fn update_active_file_id(id: FileID, config: &Config) -> Result<PathBuf> {
     let new_active_file_name = format!("{}.data", id);
     let data_dir = config.datadir();
     let new_active_file_path = data_dir.join(&new_active_file_name);
@@ -758,7 +759,8 @@ fn update_active_file_id(id: FileID, config: &Config) -> io::Result<PathBuf> {
         new_active_file_path.to_str().expect(
             "Garbled data file name",
         ),
-    )?;
+    ).chain_err(|| "Failed to update active file name in the pointer file")?;
+
     Ok(new_active_file_path)
 }
 
@@ -767,7 +769,7 @@ fn update_active_file_id(id: FileID, config: &Config) -> io::Result<PathBuf> {
 fn maybe_seal_active_data(
     active_file: &mut ActiveFile,
     config: &Config,
-) -> io::Result<Option<InactiveFile>> {
+) -> Result<Option<InactiveFile>> {
     // Ultimately we want to close the current active file and start
     // writing to a new one. The pointers into the old file should still
     // be active.
@@ -778,7 +780,13 @@ fn maybe_seal_active_data(
             let new_active_file_id = active_file.id + 1;
             let new_active_file_path = update_active_file_id(new_active_file_id, config)?;
             debug!("New active file is {:?}", &new_active_file_path);
-            let mut new_active_file = ActiveFile::new(new_active_file_path)?;
+
+            let mut new_active_file = ActiveFile::new(new_active_file_path.clone())
+                .chain_err(|| format!("Could not create new active file (old:\
+                                       {:?}, new: {:?})",
+                                       &active_file.name,
+                                       &new_active_file_path))?;
+
             std::mem::swap(&mut new_active_file, active_file);
             new_active_file
         };
@@ -1055,19 +1063,19 @@ impl BitRust {
         Ok(BitRust { state, running })
     }
 
-    pub fn get(&mut self, key: &str) -> io::Result<Option<String>> {
+    pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         debug_timeit!("get" => {
             self.state.get(key)
         })
     }
 
-    pub fn put(&mut self, key: String, value: String) -> io::Result<()> {
+    pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
         debug_timeit!("put" => {
             self.state.put(key, value)
         })
     }
 
-    pub fn delete(&mut self, key: &str) -> io::Result<()> {
+    pub fn delete(&mut self, key: &[u8]) -> Result<()> {
         debug_timeit!("delete" => {
             self.state.delete(key)
         })
@@ -1336,20 +1344,20 @@ mod tests {
 
         let mut br = BitRust::open(cfg).unwrap();
 
-        let key = String::from("somekey");
-        let value = String::from("somevalue");
+        let key = b"somekey";
+        let value = b"somevalue";
 
         let entry_sz = 4 // checksum
                      + 8 // timestamp
                      + 2 // key size
                      + 2 // val size
-                     + key.as_bytes().len()
-                     + value.as_bytes().len();
+                     + key.len()
+                     + value.len();
 
         let num_entries = 1000;
 
         for _ in 0..num_entries {
-            br.put(key.clone(), value.clone()).unwrap();
+            br.put(key.to_vec(), value.to_vec()).unwrap();
         }
 
         let expected_num_data_files = (num_entries as f64
@@ -1446,8 +1454,8 @@ mod tests {
         // ----------------------------------
         // total                           32
 
-        let key = String::from("somekey");
-        let value = String::from("somevalue");
+        let key = b"somekey";
+        let value = b"somevalue";
         let entry_sz: usize = 4 + 8 + 2 + 2 + key.len() + value.len();
 
         let total_entries = 256;
@@ -1455,7 +1463,7 @@ mod tests {
                                 entry_sz as f64).ceil() as usize;
 
         for _ in 0..total_entries {
-            br.put(key.clone(), value.clone()).unwrap();
+            br.put(key.to_vec(), value.to_vec()).unwrap();
         }
 
         let files_to_merge = br.state.get_files_for_merging();
@@ -1479,7 +1487,8 @@ mod tests {
         let mut br = BitRust::open(cfg).unwrap();
 
         let key_vals = (0..1000)
-                        .map(|_| (util::rand_str(), util::rand_str()))
+                        .map(|_| (util::rand_str().as_bytes().to_vec(),
+                                  util::rand_str().as_bytes().to_vec()))
                         .collect::<Vec<_>>();
 
         for (key, val) in key_vals.iter().cloned() {
@@ -1500,9 +1509,9 @@ mod tests {
         let cfg = ConfigBuilder::new(&data_dir).build();
         let mut br = BitRustState::new(cfg).unwrap();
 
-        br.put("foo".to_string(), "bar".to_string()).unwrap();
-        let r = br.get("foo").unwrap().unwrap();
-        assert!(r == "bar");
+        br.put(b"foo".to_vec(), b"bar".to_vec()).unwrap();
+        let r = br.get(b"foo").unwrap().unwrap();
+        assert!(r == b"bar");
     }
 
     #[test]
@@ -1523,11 +1532,11 @@ mod tests {
         let cfg = ConfigBuilder::new(&data_dir).build();
         let mut br = BitRustState::new(cfg).unwrap();
 
-        br.put("foo".to_string(), "bar".to_string()).unwrap();
-        assert!(br.get("foo").unwrap().unwrap() == "bar");
+        br.put(b"foo".to_vec(), b"bar".to_vec()).unwrap();
+        assert!(br.get(b"foo").unwrap().unwrap() == b"bar");
 
-        br.delete("foo").unwrap();
-        assert!(br.get("foo").unwrap().is_none());
+        br.delete(b"foo").unwrap();
+        assert!(br.get(b"foo").unwrap().is_none());
     }
 
     #[bench]
@@ -1536,8 +1545,8 @@ mod tests {
         let config = ConfigBuilder::new(&data_dir).build();
         let mut br = BitRust::open(config).unwrap();
 
-        let key = util::rand_str();
-        let val = util::rand_str();
+        let key = util::rand_str().as_bytes().to_vec();
+        let val = util::rand_str().as_bytes().to_vec();
         b.iter(move || { br.put(key.clone(), val.clone()).unwrap(); });
     }
 }

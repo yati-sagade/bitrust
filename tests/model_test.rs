@@ -15,10 +15,10 @@ fn test_model_based_load_store() {
     let mut model = HashMap::new();
 
     for _ in 0..1000 {
-        let key = rand_str();
-        let val = rand_str();
+        let key = rand_str().as_bytes().to_vec();
+        let val = rand_str().as_bytes().to_vec();
         model.insert(key.clone(), val.clone());
-        br.put(key.clone(), val).unwrap();
+        br.put(key.clone(), val.clone()).unwrap();
         assert!(&br.get(&key).unwrap().unwrap() == model.get(&key).unwrap());
     }
 

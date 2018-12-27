@@ -126,7 +126,7 @@ fn cmd_loop(br: &mut BitRust) -> Result<()> {
             let key = cmd[1];
             let val = cmd[2];
 
-            br.put(key.to_string(), val.to_string())
+            br.put(key.as_bytes().to_vec(), val.as_bytes().to_vec())
               .chain_err(|| "put failed")?;
 
         } else if cmd[0] == "get" {
@@ -140,7 +140,7 @@ fn cmd_loop(br: &mut BitRust) -> Result<()> {
             }
             let key = cmd[1];
 
-            println!("{:?}", br.get(key));
+            println!("{:?}", br.get(key.as_bytes()));
 
         } else if cmd[0] == "lst" {
             for key in br.keys() {
@@ -159,7 +159,7 @@ fn cmd_loop(br: &mut BitRust) -> Result<()> {
                     break;
                 }
             }
-            println!("{:?}", br.delete(cmd[1]));
+            println!("{:?}", br.delete(cmd[1].as_bytes()));
         } else if cmd[0] == "_merge" {
             br.merge()?;
         } else if cmd[0] == "exit" || cmd[0] == "quit" {
