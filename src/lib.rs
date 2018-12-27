@@ -342,37 +342,66 @@ impl BitRustDataRecord {
 
     // TODO: Do checksum validation
     pub fn next_from_file<R: ReadableFile>(file: &mut R) ->
-            io::Result<Option<BitRustDataRecord>> {
+            Result<Option<BitRustDataRecord>> {
         let (checksum, timestamp, key_size, val_size) = {
             let mut header_bytes = vec![0; BitRustDataRecord::header_size()];
 
-            let offset = file.tell()?;
+            let offset = file.tell()
+                             .chain_err(|| "Could not get current offset of\
+                                            stream for reading the next\
+                                            BitRustDataRecord")?;
+
             let result = file.read_exact_from_current_offset(&mut header_bytes);
 
             if let Err(e) = result {
-                return if e.kind() == io::ErrorKind::UnexpectedEof
-                        && offset == file.tell()? {
-                    Ok(None)
+                let new_offset = file.tell()
+                                 .chain_err(|| "Could not get current offset of\
+                                                stream for reading the next\
+                                                BitRustDataRecord")?;
+
+                if e.kind() == io::ErrorKind::UnexpectedEof && offset == new_offset {
+                    // In this case, we attempted a read right at the end of the
+                    // stream, since the file pointer (given by `offset`) did not
+                    // move after the read. This just means there are no more
+                    // records to read.
+                    //
+                    // Also as a note, POSIX doesn't require feof() to indicate
+                    // EOF unless an attempt to read past EOF is made. If we
+                    // are sitting on EOF, but the previous read was successful,
+                    // File::eof() might very well return false until an attempt
+                    // to read is made.
+                    return Ok(None);
                 } else {
-                    Err(e)
+                    // Here, we read a few bytes, but reached a premature EOF
+                    // before we could fleshen the full header. This is bad.
+                    return Err(e)
+                        .chain_err(|| "Error reading record header from stream");
                 };
             }
 
             let mut start = 0;
             let mut end = mem::size_of::<u32>();
-            let checksum = (&header_bytes[start..end]).read_u32::<BigEndian>()?;
+            let checksum = (&header_bytes[start..end])
+                            .read_u32::<BigEndian>()
+                            .chain_err(|| "Error reading checksum from record header")?;
 
             start = end;
             end += mem::size_of::<u64>();
-            let timestamp = (&header_bytes[start..end]).read_u64::<BigEndian>()?;
+            let timestamp = (&header_bytes[start..end])
+                            .read_u64::<BigEndian>()
+                            .chain_err(|| "Error reading timestamp from record header")?;
 
             start = end;
             end += mem::size_of::<u16>();
-            let key_size = (&header_bytes[start..end]).read_u16::<BigEndian>()?;
+            let key_size = (&header_bytes[start..end])
+                            .read_u16::<BigEndian>()
+                            .chain_err(|| "Error reading key size from record header")?;
 
             start = end;
             end += mem::size_of::<u16>();
-            let val_size = (&header_bytes[start..end]).read_u16::<BigEndian>()?;
+            let val_size = (&header_bytes[start..end])
+                            .read_u16::<BigEndian>()
+                            .chain_err(|| "Error reading val size from record header")?;
 
             (checksum, timestamp, key_size, val_size)
         };
@@ -380,7 +409,9 @@ impl BitRustDataRecord {
         let (key_bytes, val_bytes) = {
             let mut buf = vec![0; key_size as usize + val_size as usize];
 
-            file.read_exact_from_current_offset(&mut buf)?;
+            file.read_exact_from_current_offset(&mut buf)
+                .chain_err(|| "Error reading variable part of record from stream")?;
+
             let key_bytes = &buf[..key_size as usize];
             let val_bytes = &buf[key_size as usize..];
 
@@ -542,11 +573,16 @@ impl BitRustState {
     // a key is seen with a tombstone, one can not just drop it, as there
     // might be a newer file that contains a non-tombstone value for the
     // key.
-    pub fn merge(&mut self) -> io::Result<()> {
+    pub fn merge(&mut self) -> Result<()> {
         // Try to get a merge-lock on the active directory.
         // Go through the files in ascending order of ids
-        let merge_lockfile = locking::acquire(&self.config.datadir(),
-                                              BitrustOperation::Merge)?;
+        let merge_lockfile = locking::acquire(
+            &self.config.datadir(),
+            BitrustOperation::Merge
+        )
+        .chain_err(|| format!("Failed to acquire merge lock in {:?}",
+                               &self.config.datadir()))?;
+
 
         debug!("Acquired merge lockfile");
 
@@ -561,7 +597,10 @@ impl BitRustState {
             let mut merge_files = Vec::new();
             for (id, file_path) in files_to_merge.into_iter() {
                 // TODO: partial merges even if we fail to open some files.
-                let merge_file = InactiveFile::new(file_path)?;
+                let merge_file =
+                    InactiveFile::new(file_path.clone())
+                        .chain_err(|| format!("Failed to open inactive file\
+                                               {:?} for merging", &file_path))?;
                 merge_files.push(merge_file);
             }
             merge_files
@@ -974,7 +1013,7 @@ where
 
     {
         let mut val_bytes = vec![0u8; val_size as usize];
-        // Don't actually need the value, to advance the pointer.
+        // Don't actually need the value, this is just to advance the pointer.
         reader.read_exact(&mut val_bytes)?;
     }
     new_offset += u64::from(val_size);
@@ -1032,7 +1071,7 @@ impl BitRust {
         })
     }
 
-    pub fn merge(&mut self) -> io::Result<()> {
+    pub fn merge(&mut self) -> Result<()> {
         debug_timeit!("merge" => {
             self.state.merge()
         })
@@ -1050,7 +1089,7 @@ fn active_file_path<P: AsRef<Path>>(data_dir: P) -> io::Result<PathBuf> {
 
 fn merge_one_file(keydir: &mut KeyDir,
                   file_map: &mut HashMap<FileID, PathBuf>,
-                  mut merge_file: InactiveFile) -> io::Result<()>
+                  mut merge_file: InactiveFile) -> Result<()>
 {
     while let Some(record) = BitRustDataRecord::next_from_file(&mut merge_file)? {
         debug!("Merging {:?}", &record);
