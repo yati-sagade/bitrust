@@ -443,9 +443,12 @@ pub struct BitRustState {
 }
 
 impl BitRustState {
-    pub fn new(config: Config) -> io::Result<BitRustState> {
+    pub fn new(config: Config) -> Result<BitRustState> {
+
         info!("Making a bitrust");
-        fs::create_dir_all(config.datadir())?;
+        fs::create_dir_all(config.datadir())
+            .chain_err(|| format!("Failed to ensure that datadir is created at {:?}\
+                                   (permission issues?)", &config.datadir()))?;
 
         let data_dir = config.datadir().to_path_buf();
 
@@ -457,7 +460,9 @@ impl BitRustState {
         // returned object goes out of scope. Since we move it into the
         // returned BitRustState, this means the lock lives as long as the returned
         // BitRustState lives.
-        let lockfile = locking::acquire(&data_dir, BitrustOperation::Write)?;
+        let lockfile = locking::acquire(&data_dir, BitrustOperation::Write)
+                        .chain_err(|| format!("Failed to obtain write lock in {:?}",
+                                              &data_dir))?;
 
         debug!("Obtained data directory lock");
 
@@ -467,13 +472,9 @@ impl BitRustState {
         // hint file is optional, but cannot exist without a corresponding data
         // file (because hint files just contain pointers into the respective
         // data files)
-        let data_and_hint_files = util::get_data_and_hint_files(&data_dir)?;
-
-        debug!(
-            "Got {} data/hint file entries from {:?}",
-            data_and_hint_files.len(),
-            &data_dir
-        );
+        let data_and_hint_files = util::get_data_and_hint_files(&data_dir)
+            .chain_err(|| format!("Failed to enumerate contents of the data dir\
+                                   {:?} when starting up bitrust", &data_dir))?;
 
         let (keydir, file_map) = if data_and_hint_files.len() == 0 {
             // We are starting from scratch, write the name of the active file
@@ -483,12 +484,14 @@ impl BitRustState {
                 "Starting in an empty data directory, writing {:?}",
                 &ptr_path
             );
+
             util::write_to_file(
                 &ptr_path,
                 data_dir.join("0.data").to_str().expect(
                     "Garbled initial data file name?",
                 ),
-            )?;
+            ).chain_err(|| format!("Failed to write active file name to the\
+                                    pointer file {:?}", &ptr_path))?;
 
             let mut file_map: HashMap<FileID, PathBuf> = HashMap::new();
             file_map.insert(0, data_dir.join("0.data"));
@@ -510,13 +513,19 @@ impl BitRustState {
         let active_file_name = active_file_path(&data_dir)?;
         debug!("Using active file {:?}", &active_file_name);
 
-        let active_file = ActiveFile::new(active_file_name)?;
+        let active_file = ActiveFile::new(active_file_name.clone())
+            .chain_err(|| format!("Could not open active file {:?}",
+                                  &active_file_name))?;
 
         let mut inactive_files = HashMap::new();
         for (file_id, (data_file, _)) in data_and_hint_files.into_iter() {
             let data_file = data_file.expect("data file path is none!");
             if file_id != active_file.id {
-                inactive_files.insert(file_id, InactiveFile::new(data_file)?);
+                let inactive_file = InactiveFile::new(data_file.clone())
+                    .chain_err(|| format!("Failed to open inactive file at {:?} for\
+                                           reading into keydir", &data_file))?;
+
+                inactive_files.insert(file_id, inactive_file);
             }
         }
 
@@ -782,7 +791,7 @@ fn maybe_seal_active_data(
 }
 
 fn build_keydir(dd_contents: util::DataDirContents)
-        -> io::Result<(KeyDir, HashMap<FileID, PathBuf>)> {
+        -> Result<(KeyDir, HashMap<FileID, PathBuf>)> {
     info!("Making keydir");
 
     // First sort the data and hint files by file_id ascending so we process
@@ -802,23 +811,22 @@ fn build_keydir(dd_contents: util::DataDirContents)
             )
         });
 
-        add_data_file_to_filemap(&mut file_map,
-                                 file_id,
-                                 &data_file);
+        add_data_file_to_filemap(&mut file_map, file_id, &data_file);
 
         // If we have the hint file, we prefer reading it since it is almost
         // a direct on-disk representation of the keydir.
         if let Some(hint_file) = hint_file {
             debug!("Reading hint file for file id {}", file_id);
-            read_hint_file_into_keydir(file_id,
-                                       &hint_file,
-                                       &data_file,
-                                       &mut keydir)?;
+
+            read_hint_file_into_keydir(file_id, &hint_file, &data_file, &mut keydir)
+                .chain_err(|| format!("Failed to read hint file {:?} into keydir",
+                                      &hint_file))?;
+
         } else {
             debug!("Reading data file id {}", file_id);
-            read_data_file_into_keydir(file_id,
-                                       &data_file,
-                                       &mut keydir)?;
+            read_data_file_into_keydir(file_id, &data_file, &mut keydir)
+                .chain_err(|| format!("Failed to read data file {:?} into keydir",
+                                      &data_file))?;
         }
     }
     Ok((keydir, file_map))
@@ -1040,7 +1048,7 @@ impl Drop for BitRust {
 }
 
 impl BitRust {
-    pub fn open(config: Config) -> io::Result<BitRust> {
+    pub fn open(config: Config) -> Result<BitRust> {
         let state = BitRustState::new(config)?;
         let running = Arc::new(atomic::AtomicBool::new(true));
 
@@ -1082,9 +1090,12 @@ fn active_file_pointer_path<P: AsRef<Path>>(data_dir: P) -> PathBuf {
     data_dir.as_ref().join(".activefile")
 }
 
-fn active_file_path<P: AsRef<Path>>(data_dir: P) -> io::Result<PathBuf> {
+fn active_file_path<P: AsRef<Path>>(data_dir: P) -> Result<PathBuf> {
     let ptr_path = active_file_pointer_path(data_dir);
-    util::read_from_file(ptr_path).map(PathBuf::from)
+    util::read_from_file(&ptr_path)
+        .map(PathBuf::from)
+        .chain_err(|| format!("Failed to read active file name from pointer file {:?}",
+                              &ptr_path))
 }
 
 fn merge_one_file(keydir: &mut KeyDir,
@@ -1503,9 +1514,6 @@ mod tests {
 
         let another_br = BitRustState::new(cfg);
         assert!(another_br.is_err());
-        if let Err(e) = another_br {
-            assert!(e.kind() == io::ErrorKind::AlreadyExists);
-        }
     }
 
     #[test]
