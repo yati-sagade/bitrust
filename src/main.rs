@@ -69,6 +69,7 @@ fn get_usage(cmd_usages: &[(&'static str, &'static str)], cmd_name: &str) -> Opt
     None
 }
 
+
 fn cmd_loop(br: &mut BitRust) -> Result<()> {
 
     ctrlc::set_handler(move || {
@@ -140,7 +141,19 @@ fn cmd_loop(br: &mut BitRust) -> Result<()> {
             }
             let key = cmd[1];
 
-            println!("{:?}", br.get(key.as_bytes()));
+            match br.get(key.as_bytes()) {
+                e@Err(_) => println!("{:?}", e),
+                v@Ok(None) => println!("{:?}", v),
+                Ok(Some(val)) => {
+                    if let Ok(val_str) = String::from_utf8(val.clone()) {
+                        let v: Result<Option<String>> = Ok(Some(val_str));
+                        println!("{:?}", v);
+                    } else {
+                        let v: Result<Option<Vec<u8>>> = Ok(Some(val));
+                        println!("{:?}", v);
+                    }
+                }
+            }
 
         } else if cmd[0] == "lst" {
             for key in br.keys() {
