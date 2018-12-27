@@ -5,6 +5,7 @@ extern crate simplelog;
 extern crate getopts;
 extern crate ctrlc;
 extern crate tempfile;
+extern crate isatty;
 
 use std::time::Instant;
 use std::io::{self, Write};
@@ -44,6 +45,8 @@ fn main() -> io::Result<()> {
             return Err(e);
         }
     };
+
+
     if let Some(cmd) = matches.opt_str("b") {
         match cmd.as_str() {
             "put" => bench_put(),
@@ -98,11 +101,21 @@ fn cmd_loop(br: &mut BitRust) -> io::Result<()> {
         ("help", "help/?\n  Show this message"),
     ];
 
+    let isatty = isatty::stdin_isatty();
 
     loop {
         let mut cmd = String::new();
-        prompt()?;
+
+        if isatty {
+            prompt()?;
+        }
+
         io::stdin().read_line(&mut cmd)?;
+
+        if cmd.len() == 0 {
+            break;
+        }
+
         let cmd = cmd.trim().split_whitespace().collect::<Vec<_>>();
 
         if cmd.len() == 0 {
@@ -117,7 +130,11 @@ fn cmd_loop(br: &mut BitRust) -> io::Result<()> {
         } else if cmd[0] == "put" {
             if cmd.len() != 3 {
                 println!("{}", get_usage(&cmd_usages, "put").unwrap());
-                continue;
+                if isatty {
+                    continue;
+                } else {
+                    break;
+                }
             }
             let key = cmd[1];
             let val = cmd[2];
@@ -125,7 +142,11 @@ fn cmd_loop(br: &mut BitRust) -> io::Result<()> {
         } else if cmd[0] == "get" {
             if cmd.len() != 2 {
                 println!("{}", get_usage(&cmd_usages, "get").unwrap());
-                continue;
+                if isatty {
+                    continue;
+                } else {
+                    break;
+                }
             }
             let key = cmd[1];
             println!("{:?}", br.get(key));
@@ -140,7 +161,11 @@ fn cmd_loop(br: &mut BitRust) -> io::Result<()> {
         } else if cmd[0] == "del" {
             if cmd.len() != 2 {
                 println!("{}", get_usage(&cmd_usages, "del").unwrap());
-                continue;
+                if isatty {
+                    continue;
+                } else {
+                    break;
+                }
             }
             println!("{:?}", br.delete(cmd[1]));
         } else if cmd[0] == "_merge" {
@@ -148,7 +173,12 @@ fn cmd_loop(br: &mut BitRust) -> io::Result<()> {
         } else if cmd[0] == "exit" || cmd[0] == "quit" {
             break;
         } else {
-            println!("Invalid command {}, try typing help", cmd[0]);
+            if !isatty {
+                println!("Invalid command {}, quitting", cmd[0]);
+                break;
+            } else {
+                println!("Invalid command {}, try typing help", cmd[0]);
+            }
         }
     }
     info!("Exit");
