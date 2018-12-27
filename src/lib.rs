@@ -549,11 +549,6 @@ impl BitRustState {
         Ok(bitrust)
     }
 
-    pub fn active_file_size(&mut self) -> io::Result<u64> {
-        let _lock = self.rwlock.write().unwrap();
-        self.active_file.tell()
-    }
-
     /// Returns a vector of `(file_id, path_to_file)` tuples, sorted ascending
     /// by `file_id`.
     fn get_files_for_merging(&self) -> Vec<(FileID, PathBuf)> {
