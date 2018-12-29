@@ -102,21 +102,24 @@ impl KeyDirEntry {
 pub struct KeyDir {
     /// mapping from a key to its keydir entry
     entries: HashMap<Vec<u8>, KeyDirEntry>,
-
+    rwlock: Arc<RwLock<()>>,
 }
 
 impl KeyDir {
     fn new() -> KeyDir {
         KeyDir {
             entries: HashMap::new(),
+            rwlock: Arc::new(RwLock::new(())),
         }
     }
 
     fn insert(&mut self, key: Vec<u8>, entry: KeyDirEntry) {
+        let _write_lock = self.rwlock.write().unwrap();
         self.entries.insert(key, entry);
     }
 
     fn get<'a>(&'a self, key: &[u8]) -> Option<&'a KeyDirEntry> {
+        let _read_lock = self.rwlock.read().unwrap();
         self.entries.get(key)
     }
 }
@@ -432,9 +435,6 @@ pub struct BitRustState {
 
     inactive_files: HashMap<FileID, InactiveFile>,
 
-    /// mapping from file id to its path on disk
-    file_map: HashMap<FileID, PathBuf>,
-
     lockfile: lockfile::LockFile,
     // A ghost lock object, used to hold R/W locks on the entire bitrust
     // instance.
@@ -478,7 +478,7 @@ impl BitRustState {
             .chain_err(|| format!("Failed to enumerate contents of the data dir\
                                    {:?} when starting up bitrust", &data_dir))?;
 
-        let (keydir, file_map) = if data_and_hint_files.len() == 0 {
+        let keydir = if data_and_hint_files.len() == 0 {
             // We are starting from scratch, write the name of the active file
             // as 0.data.
             let ptr_path = active_file_pointer_path(&data_dir);
@@ -495,12 +495,7 @@ impl BitRustState {
             ).chain_err(|| format!("Failed to write active file name to the\
                                     pointer file {:?}", &ptr_path))?;
 
-            let mut file_map: HashMap<FileID, PathBuf> = HashMap::new();
-            file_map.insert(0, data_dir.join("0.data"));
-
-            let keydir = KeyDir::new();
-
-            (keydir, file_map)
+            KeyDir::new()
         } else {
             debug!("Now building keydir with these files: {:?}",
                    &data_and_hint_files);
@@ -537,7 +532,6 @@ impl BitRustState {
             keydir,
             config: config,
             inactive_files: inactive_files,
-            file_map,
             active_file: active_file,
             lockfile,
             rwlock: Arc::new(RwLock::new(())),
@@ -552,17 +546,11 @@ impl BitRustState {
     /// Returns a vector of `(file_id, path_to_file)` tuples, sorted ascending
     /// by `file_id`.
     fn get_files_for_merging(&self) -> Vec<(FileID, PathBuf)> {
+        let datadir = self.config.datadir();
         let mut files_to_merge: Vec<(FileID, PathBuf)> = self.inactive_files
             .keys()
             .cloned()
-            .map(|id| {
-                let file_path = self.file_map.get(&id).expect(&format!(
-                    "Could not find file id {} in the map! This is bad: {:?}",
-                    id,
-                    &self.file_map,
-                ));
-                (id, file_path.clone())
-            })
+            .map(|id| (id, data_file_name_from_id(id, &datadir)) )
             .collect();
 
         // Sort the above tuples by file id
@@ -617,7 +605,7 @@ impl BitRustState {
         // If record.key exists, but
         for merge_file in merge_files.into_iter() {
             merge_one_file(&mut self.keydir,
-                           &mut self.file_map,
+                           &mut self.inactive_files,
                            merge_file)?;
         }
 
@@ -667,16 +655,9 @@ impl BitRustState {
         let keydir = &mut self.keydir;
         let active_file = &mut self.active_file;
         let config = &self.config;
-        let file_map = &mut self.file_map;
 
         maybe_seal_active_data(active_file, config)?
             .map(|inactive_file| {
-
-                // Add the new active file to the filemap
-                add_data_file_to_filemap(file_map,
-                                         active_file.id,
-                                         &active_file.name);
-
                 inactive_files.insert(inactive_file.id, inactive_file)
             });
 
@@ -743,11 +724,14 @@ fn should_seal_active_data(active_file: &mut ActiveFile, config: &Config) -> Res
     ).chain_err(|| "Failed to find size of active file by ftelling it")
 }
 
+fn data_file_name_from_id<P: AsRef<Path>>(id: FileID, datadir: P) -> PathBuf {
+    datadir.as_ref().join(&format!("{}.data", id))
+}
+
 fn update_active_file_id(id: FileID, config: &Config) -> Result<PathBuf> {
-    let new_active_file_name = format!("{}.data", id);
     let data_dir = config.datadir();
-    let new_active_file_path = data_dir.join(&new_active_file_name);
-    let ptr_path = active_file_pointer_path(data_dir);
+    let new_active_file_path = data_file_name_from_id(id, &data_dir);
+    let ptr_path = active_file_pointer_path(&data_dir);
 
     util::write_to_file(
         &ptr_path,
@@ -793,8 +777,7 @@ fn maybe_seal_active_data(
     }
 }
 
-fn build_keydir(dd_contents: util::DataDirContents)
-        -> Result<(KeyDir, HashMap<FileID, PathBuf>)> {
+fn build_keydir(dd_contents: util::DataDirContents) -> Result<KeyDir> {
     info!("Making keydir");
 
     // First sort the data and hint files by file_id ascending so we process
@@ -804,7 +787,6 @@ fn build_keydir(dd_contents: util::DataDirContents)
     dd_entries.sort_by(|v1, v2| v1.0.cmp(&v2.0));
 
     let mut keydir = KeyDir::new();
-    let mut file_map = HashMap::new();
 
     for (file_id, (data_file, hint_file)) in dd_entries {
         let data_file = data_file.unwrap_or_else(|| {
@@ -813,8 +795,6 @@ fn build_keydir(dd_contents: util::DataDirContents)
                 file_id
             )
         });
-
-        add_data_file_to_filemap(&mut file_map, file_id, &data_file);
 
         // If we have the hint file, we prefer reading it since it is almost
         // a direct on-disk representation of the keydir.
@@ -832,20 +812,7 @@ fn build_keydir(dd_contents: util::DataDirContents)
                                       &data_file))?;
         }
     }
-    Ok((keydir, file_map))
-}
-
-fn add_data_file_to_filemap<P>(file_map: &mut HashMap<FileID, PathBuf>,
-                               file_id: FileID,
-                               data_file_path: P)
-where P: AsRef<Path>
-{
-    if let Some(ref existing_data_file_path) = file_map.get(&file_id) {
-        panic!("Unexpected path {:?} found for file id {} in the filemap",
-               existing_data_file_path,
-               file_id);
-    }
-    file_map.insert(file_id, data_file_path.as_ref().to_path_buf());
+    Ok(keydir)
 }
 
 fn read_hint_file_into_keydir<P>(
@@ -1102,11 +1069,10 @@ fn active_file_path<P: AsRef<Path>>(data_dir: P) -> Result<PathBuf> {
 }
 
 fn merge_one_file(keydir: &mut KeyDir,
-                  file_map: &mut HashMap<FileID, PathBuf>,
+                  inactive_files: &mut HashMap<FileID, InactiveFile>,
                   mut merge_file: InactiveFile) -> Result<()>
 {
     while let Some(record) = BitRustDataRecord::next_from_file(&mut merge_file)? {
-        debug!("Merging {:?}", &record);
     }
     Ok(())
 }
@@ -1394,15 +1360,6 @@ mod tests {
                 format!("Expected {} data files, found {}",
                         expected_num_data_files,
                         data_files.len()));
-
-        assert!(br.state.file_map.len() == data_files.len());
-
-        for data_file in data_files.into_iter() {
-            let file_id = util::file_id_from_path(&data_file);
-            assert!(*br.state.file_map.get(&file_id).unwrap() == data_file);
-        }
-
-
     }
 
     #[test]
@@ -1421,9 +1378,6 @@ mod tests {
         assert!(br.state.active_file.name == data_dir.as_ref().join("0.data"));
         assert!(br.state.keydir.entries.len() == 0);
         assert!(br.state.inactive_files.len() == 0);
-
-        assert!(br.state.file_map.len() == 1);
-        assert!(*br.state.file_map.get(&0).unwrap() == data_dir.as_ref().join("0.data"));
     }
 
     #[test]
