@@ -64,5 +64,10 @@ impl KeyDir {
         let _read_lock = self.rwlock.read().unwrap();
         self.entries.get(key)
     }
+
+    pub fn keys<'a>(&'a self) -> Vec<&'a [u8]> {
+        let _read_lock = self.rwlock.read().unwrap();
+        self.entries.keys().map(|v| &v[..]).collect()
+    }
 }
 

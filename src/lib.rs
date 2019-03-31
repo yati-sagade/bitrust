@@ -32,7 +32,7 @@ use std::io::{self, Cursor};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write, Seek, SeekFrom};
 use std::mem;
-use std::sync::{RwLock, Arc};
+use std::sync::{Mutex, Arc};
 use std::sync::atomic;
 
 use bytes::{BytesMut, Bytes, BufMut, Buf};
@@ -369,9 +369,13 @@ pub struct BitRustState {
     inactive_files: HashMap<FileID, InactiveFile>,
 
     lockfile: lockfile::LockFile,
-    // A ghost lock object, used to hold R/W locks on the entire bitrust
-    // instance.
-    rwlock: Arc<RwLock<()>>,
+
+    // mutex for writers. There is an additional R/W lock at the keydir level
+    // (see keydir::KeyDir) which takes care of concurrent updates of the
+    // keydir. This lock is to synchronize writes since they involve writing
+    // to data files (as opposed to reads, which read immutable records from
+    // those files).
+    mutex: Arc<Mutex<()>>,
 
     config: Config,
     data_file_id_gen: util::FileIDGen,
@@ -467,7 +471,7 @@ impl BitRustState {
             inactive_files: inactive_files,
             active_file: active_file,
             lockfile,
-            rwlock: Arc::new(RwLock::new(())),
+            mutex: Arc::new(Mutex::new(())),
             data_file_id_gen: util::FileIDGen::new(active_file_id + 1)
         };
 
@@ -547,7 +551,7 @@ impl BitRustState {
 
     pub fn put(&mut self, key: Vec<u8>, val: Vec<u8>) -> Result<()> {
 
-        let _lock = self.rwlock.write().unwrap();
+        let _lock = self.mutex.lock().unwrap();
 
         let timestamp_now = {
             let dur_since_unix_epoch = SystemTime::now()
@@ -579,7 +583,7 @@ impl BitRustState {
         );
 
         // Borrowing the field directly is needed here since self cannot be
-        // borrowed mutably because of the rwlock in scope, which has an
+        // borrowed mutably because of the mutex in scope, which has an
         // immutable borrow on self until the function ends.
         //
         // This is also why maybe_seal_active_data() is a function accepting
@@ -599,9 +603,8 @@ impl BitRustState {
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
 
-        let _lock = self.rwlock.read().unwrap();
-
         let entry = self.keydir.get(key);
+
         if let Some(entry) = entry {
             let record = if entry.file_id == self.active_file.id {
                 debug!("Fetching from active file (id {})", entry.file_id);
@@ -646,8 +649,7 @@ impl BitRustState {
     }
 
     pub fn keys<'a>(&'a self) -> Vec<&'a [u8]> {
-        let _lock = self.rwlock.read().unwrap();
-        self.keydir.entries.keys().map(|v| &v[..]).collect()
+        self.keydir.keys()
     }
 }
 
