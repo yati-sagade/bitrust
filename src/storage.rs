@@ -1,4 +1,4 @@
-use std::io::{self, Read, Write, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::fs::File;
 
 pub trait ReadableFile {

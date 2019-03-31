@@ -16,8 +16,6 @@ extern crate lazy_static;
 #[macro_use]
 extern crate error_chain;
 
-use std::thread;
-
 pub mod util;
 mod locking;
 mod lockfile;
@@ -27,20 +25,17 @@ mod errors;
 mod storage;
 mod keydir;
 
-
-
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use std::path::{PathBuf, Path};
 use std::io::{self, Cursor};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write, Seek, SeekFrom};
-use std::process;
 use std::mem;
 use std::sync::{RwLock, Arc};
 use std::sync::atomic;
 
-use bytes::{BytesMut, Bytes, BufMut, IntoBuf, Buf};
+use bytes::{BytesMut, Bytes, BufMut, Buf};
 use byteorder::{ReadBytesExt, BigEndian};
 
 pub use errors::*;
@@ -739,7 +734,7 @@ fn build_keydir(dd_contents: util::DataDirContents) -> Result<KeyDir> {
         if let Some(hint_file) = hint_file {
             debug!("Reading hint file for file id {}", file_id);
 
-            read_hint_file_into_keydir(file_id, &hint_file, &data_file, &mut keydir)
+            read_hint_file_into_keydir(file_id, &hint_file, &mut keydir)
                 .chain_err(|| format!("Failed to read hint file {:?} into keydir",
                                       &hint_file))?;
 
@@ -756,7 +751,6 @@ fn build_keydir(dd_contents: util::DataDirContents) -> Result<KeyDir> {
 fn read_hint_file_into_keydir<P>(
     file_id: FileID,
     hint_file_path: P,
-    data_file_path: P,
     keydir: &mut KeyDir,
 ) -> io::Result<()>
 where
@@ -1149,7 +1143,6 @@ mod tests {
 
         read_hint_file_into_keydir(0,
                                    &hint_file_path,
-                                   &data_file_path,
                                    &mut keydir).unwrap();
 
         for guide_record in &guide_records {

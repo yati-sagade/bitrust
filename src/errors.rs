@@ -1,7 +1,4 @@
-#[macro_use]
-use error_chain;
-
-error_chain! {
+error_chain! { // comes from crate error_chain
     errors {
         InvalidData(msg: String) {
             description("Invalid or corrupted data was encountered"),
