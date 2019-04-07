@@ -102,6 +102,10 @@ impl ActiveFile {
         debug!("Appended {} bytes to at offset {}", bytes.len(), offset);
         self.write_handle.write_all(bytes).map(|_| offset)
     }
+
+    pub fn unappend(&mut self, num_bytes_to_retreat: u32) -> io::Result<u64> {
+        self.write_handle.seek(SeekFrom::Current(-(num_bytes_to_retreat as i64)))
+    }
 }
 
 
@@ -378,6 +382,14 @@ pub struct BitRustState {
     mutex: Arc<Mutex<()>>,
 
     config: Config,
+
+    // Apart from the initialization code, this is used by put() to overflow
+    // data files (i.e., to start a new active file when the current one
+    // becomes too big), and by merge(), to get a name for the merge output
+    // files, which will replace all older inactive data files after the merge.
+    //
+    // When a write and a merge are happening concurrently, access to this
+    // needs to be synchronized using `mutex` above.
     data_file_id_gen: util::FileIDGen,
 }
 
@@ -504,7 +516,8 @@ impl BitRustState {
     // a key is seen with a tombstone, one can not just drop it, as there
     // might be a newer file that contains a non-tombstone value for the
     // key.
-    pub fn merge(&mut self) -> Result<()> {
+    pub fn merge(&mut self) -> Result<()>
+    {
         // Try to get a merge-lock on the active directory.
         // Go through the files in ascending order of ids
         let merge_lockfile = locking::acquire(
@@ -537,13 +550,28 @@ impl BitRustState {
             merge_files
         };
 
+        let mut merge_output_file = {
+            let mutex = self.mutex.clone();
+            let merge_output_file_id = {
+                let _lock = mutex.lock().unwrap();
+                self.data_file_id_gen.take_next_id()
+            };
+            let merge_output_file_name = data_file_name_from_id(
+                merge_output_file_id,
+                &self.config.datadir()
+            );
+            ActiveFile::new(merge_output_file_name)
+            .chain_err(|| "Failed to open a new merge file for writing")
+        }?;
+
         // Read records sequentially from the file.
         // If record.key does not exist in our keydir, move on.
         // If record.key exists, but
-        for merge_file in merge_files.into_iter() {
+        for data_file in merge_files.into_iter() {
             merge_one_file(&mut self.keydir,
                            &mut self.inactive_files,
-                           merge_file)?;
+                           data_file,
+                           &mut merge_output_file)?;
         }
 
         Ok(())
@@ -592,8 +620,9 @@ impl BitRustState {
         let keydir = &mut self.keydir;
         let active_file = &mut self.active_file;
         let config = &self.config;
+        let file_id_gen = &mut self.data_file_id_gen;
 
-        maybe_seal_active_data(active_file, config)?
+        maybe_seal_active_data(active_file, config, file_id_gen)?
             .map(|inactive_file| {
                 inactive_files.insert(inactive_file.id, inactive_file)
             });
@@ -683,6 +712,7 @@ fn update_active_file_id(id: FileID, config: &Config) -> Result<PathBuf> {
 fn maybe_seal_active_data(
     active_file: &mut ActiveFile,
     config: &Config,
+    file_id_gen: &mut util::FileIDGen
 ) -> Result<Option<InactiveFile>> {
     // Ultimately we want to close the current active file and start
     // writing to a new one. The pointers into the old file should still
@@ -691,7 +721,7 @@ fn maybe_seal_active_data(
         debug!("Active file is too big, sealing");
         let old_active_file = {
             // XXX: ensure there are no conflicts
-            let new_active_file_id = active_file.id + 1;
+            let new_active_file_id = file_id_gen.take_next_id();
             let new_active_file_path = update_active_file_id(new_active_file_id, config)?;
             debug!("New active file is {:?}", &new_active_file_path);
 
@@ -1004,9 +1034,77 @@ fn active_file_path<P: AsRef<Path>>(data_dir: P) -> Result<PathBuf> {
 
 fn merge_one_file(keydir: &mut KeyDir,
                   inactive_files: &mut HashMap<FileID, InactiveFile>,
-                  mut merge_file: InactiveFile) -> Result<()>
+                  mut data_file: InactiveFile,
+                  merge_output_file: &mut ActiveFile) -> Result<()>
 {
-    while let Some(record) = BitRustDataRecord::next_from_file(&mut merge_file)? {
+    debug!("Merging file {:?}", &data_file.name);
+
+    'record_loop:
+    while let Some(record) = BitRustDataRecord::next_from_file(&mut data_file)? {
+        // Name of the file that the keydir points to for this key.
+        if let Some(current_file_id) = keydir.get(&record.key_bytes)
+                                             .map(|entry| entry.file_id)
+        {
+            if current_file_id != data_file.id {
+                if current_file_id < data_file.id {
+                    panic!("Stale entry found for key {:?}. Keydir points to\
+                            file {}, but we see the key in file {} during\
+                            merge", &record.key_bytes, current_file_id, data_file.id);
+                }
+                // No need to merge, there is a newer file id that contains
+                // an updated value for this key.
+                continue 'record_loop;
+            }
+            // We found the key in the keydir, and (at least for the time being)
+            // the file_id pointed to from the keydir is the same as of the
+            // file we are merging. So we write out the merge record to the
+            // output file.
+            let record_bytes = record.as_bytes();
+            let record_size = record_bytes.len();
+            let record_offset = merge_output_file.append(&record_bytes)
+                .chain_err(|| "Failed to write merge record")?;
+            // BUT between now and us writind the record, a fresh write for the
+            // key might have come in. Before we update the keydir to point
+            // to the new merge output file for this key, we must check for
+            // this event, and the following sequence of operations must be
+            // done atomically:
+            //
+            //  - check if data_file.id is still the current file id in the
+            //    keydir.
+            //    * If yes, update the keydir.
+            //
+            //  If we failed to update the keydir in the above sequence, we
+            //  should erase the record we just wrote, and then continue with
+            //  the merge.
+            let timestamp_now = {
+                let dur_since_unix_epoch = SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .chain_err(|| "Time drift!")?;
+                dur_since_unix_epoch.as_secs()
+            };
+
+            let new_keydir_entry = KeyDirEntry::new(merge_output_file.id,
+                                                    record_bytes.len() as u16,
+                                                    record_offset,
+                                                    timestamp_now);
+
+            let write_successful = keydir.update_keydir_entry_if(
+                &record.key_bytes,
+                new_keydir_entry,
+                |old_keydir_entry| {
+                    old_keydir_entry.file_id == data_file.id
+                }
+            );
+
+            if !write_successful {
+                // unwrite the record we just wrote.
+                merge_output_file.unappend(record_size as u32)
+                    .chain_err(|| "Cannont unappend record during merge!")?;
+            }
+        } else {
+            // No need to merge, since the keydir does not contain this key,
+            // which means the key was deleted.
+        }
     }
     Ok(())
 }

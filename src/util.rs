@@ -69,6 +69,8 @@ impl FileIDGen {
         FileIDGen { next_id }
     }
 
+    /// Note this is not atomic; you are responsible for synchronized calling
+    /// of this method.
     pub fn take_next_id(&mut self) -> FileID {
         let ret = self.next_id;
         self.next_id += 1;
