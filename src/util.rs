@@ -60,23 +60,26 @@ where
 }
 
 #[derive(Debug)]
-pub struct FileIDGen {
-    next_id: FileID,
+pub struct Serial<T> {
+    next: T,
 }
 
-impl FileIDGen {
-    pub fn new(next_id: FileID) -> FileIDGen {
-        FileIDGen { next_id }
+impl<T> Serial<T> where T: std::ops::AddAssign + num::One + Clone {
+    pub fn new(next: T) -> Serial<T> {
+        Serial { next }
     }
 
     /// Note this is not atomic; you are responsible for synchronized calling
     /// of this method.
-    pub fn take_next_id(&mut self) -> FileID {
-        let ret = self.next_id;
-        self.next_id += 1;
+    pub fn take_next(&mut self) -> T {
+        let ret = self.next.clone();
+        self.next += T::one();
         ret
     }
 }
+
+pub type FileIDGen = Serial<FileID>;
+pub type LogicalClock = Serial<u64>;
 
 /// The datadir is a folder on_di the filesystem where we store our datafiles and
 /// hintfiles. This data structure maps a given file id to a tuple that contains

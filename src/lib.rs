@@ -6,6 +6,7 @@ extern crate bytes;
 extern crate crc;
 extern crate test;
 extern crate rand;
+extern crate num;
 
 #[macro_use]
 extern crate log;
@@ -26,7 +27,7 @@ mod storage;
 mod keydir;
 
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH, Instant};
+use std::time::{Instant};
 use std::path::{PathBuf, Path};
 use std::io::{self, Cursor};
 use std::fs::{self, File, OpenOptions};
@@ -391,6 +392,8 @@ pub struct BitRustState {
     // When a write and a merge are happening concurrently, access to this
     // needs to be synchronized using `mutex` above.
     data_file_id_gen: util::FileIDGen,
+
+    clock: Arc<util::LogicalClock>,
 }
 
 impl BitRustState {
@@ -427,7 +430,7 @@ impl BitRustState {
             .chain_err(|| format!("Failed to enumerate contents of the data dir\
                                    {:?} when starting up bitrust", &data_dir))?;
 
-        let keydir = if data_and_hint_files.len() == 0 {
+        let (latest_timestamp, keydir) = if data_and_hint_files.len() == 0 {
             // We are starting from scratch, write the name of the active file
             // as 0.data.
             let ptr_path = active_file_pointer_path(&data_dir);
@@ -444,7 +447,7 @@ impl BitRustState {
             ).chain_err(|| format!("Failed to write active file name to the\
                                     pointer file {:?}", &ptr_path))?;
 
-            KeyDir::new()
+            (0u64, KeyDir::new())
         } else {
             debug!("Now building keydir with these files: {:?}",
                    &data_and_hint_files);
@@ -484,7 +487,8 @@ impl BitRustState {
             active_file: active_file,
             lockfile,
             mutex: Arc::new(Mutex::new(())),
-            data_file_id_gen: util::FileIDGen::new(active_file_id + 1)
+            data_file_id_gen: util::FileIDGen::new(active_file_id + 1),
+            clock: Arc::new(util::LogicalClock::new(latest_timestamp + 1)),
         };
 
         debug!("Returning from BitRustState::new");
@@ -550,28 +554,55 @@ impl BitRustState {
             merge_files
         };
 
+        let datadir = self.config.datadir();
+
+
         let mut merge_output_file = {
             let mutex = self.mutex.clone();
             let merge_output_file_id = {
                 let _lock = mutex.lock().unwrap();
-                self.data_file_id_gen.take_next_id()
+                self.data_file_id_gen.take_next()
             };
             let merge_output_file_name = data_file_name_from_id(
                 merge_output_file_id,
-                &self.config.datadir()
+                &datadir,
             );
-            ActiveFile::new(merge_output_file_name)
-            .chain_err(|| "Failed to open a new merge file for writing")
-        }?;
+
+            let merge_active_file = ActiveFile::new(
+                merge_output_file_name.clone()
+            ).chain_err(|| "Failed to open a new merge file for writing")?;
+
+            // We will also open an InactiveFile and make it known to the bitrust
+            // state, since we will incrementally "port" keys from their current
+            // files to the new merge file.
+            let merge_inactive_file = InactiveFile::new(merge_output_file_name)
+            .chain_err(|| "Failed to open merge file for reading")?;
+
+            self.inactive_files.insert(merge_inactive_file.id,
+                                       merge_inactive_file);
+
+            merge_active_file
+        };
 
         // Read records sequentially from the file.
         // If record.key does not exist in our keydir, move on.
-        // If record.key exists, but
+        // If record.key exists, but the filename in the record does not match the file we are
+        // merging
         for data_file in merge_files.into_iter() {
+            let data_file_id = data_file.id;
             merge_one_file(&mut self.keydir,
                            &mut self.inactive_files,
                            data_file,
+                           self.mutex.clone(),
+                           &mut self.clock,
                            &mut merge_output_file)?;
+            let data_file_path = data_file_name_from_id(data_file_id, &datadir);
+            debug!("Now removing {:?} after merge", &data_file_path);
+            fs::remove_file(&data_file_path)
+                .chain_err(||
+                    format!("Could not remove file {:?} after merge to file id {:?}",
+                            &data_file_path, &merge_output_file.id))?;
+            self.inactive_files.remove(&data_file_id);
         }
 
         Ok(())
@@ -581,12 +612,9 @@ impl BitRustState {
 
         let _lock = self.mutex.lock().unwrap();
 
-        let timestamp_now = {
-            let dur_since_unix_epoch = SystemTime::now()
-                                        .duration_since(UNIX_EPOCH)
-                                        .chain_err(|| "Time drift!")?;
-            dur_since_unix_epoch.as_secs()
-        };
+        let timestamp_now = Arc::get_mut(&mut self.clock)
+                                .expect("Failed to get clock for logical timestamps")
+                                .take_next();
 
         let record = BitRustDataRecord::new(timestamp_now, key.clone(), val);
 
@@ -614,7 +642,7 @@ impl BitRustState {
         // borrowed mutably because of the mutex in scope, which has an
         // immutable borrow on self until the function ends.
         //
-        // This is also why maybe_seal_active_data() is a function accepting
+        // This is also why maybe_seal_active_file() is a function accepting
         // our fields mutably rather than a method on &mut self.
         let inactive_files = &mut self.inactive_files;
         let keydir = &mut self.keydir;
@@ -622,7 +650,7 @@ impl BitRustState {
         let config = &self.config;
         let file_id_gen = &mut self.data_file_id_gen;
 
-        maybe_seal_active_data(active_file, config, file_id_gen)?
+        maybe_seal_active_file(active_file, config, file_id_gen)?
             .map(|inactive_file| {
                 inactive_files.insert(inactive_file.id, inactive_file)
             });
@@ -684,7 +712,7 @@ impl BitRustState {
 
 fn should_seal_active_data(active_file: &mut ActiveFile, config: &Config) -> Result<bool> {
     active_file.tell().map(
-        |size| size > config.max_file_fize_bytes(),
+        |size| size >= config.max_file_fize_bytes(),
     ).chain_err(|| "Failed to find size of active file by ftelling it")
 }
 
@@ -707,9 +735,9 @@ fn update_active_file_id(id: FileID, config: &Config) -> Result<PathBuf> {
     Ok(new_active_file_path)
 }
 
-// This fn is not thread safe, and assumes that we have a write lock
-// on the state.
-fn maybe_seal_active_data(
+// This fn is not thread safe, and assumes only one caller gets to call it at
+// a time.
+fn maybe_seal_active_file(
     active_file: &mut ActiveFile,
     config: &Config,
     file_id_gen: &mut util::FileIDGen
@@ -721,7 +749,7 @@ fn maybe_seal_active_data(
         debug!("Active file is too big, sealing");
         let old_active_file = {
             // XXX: ensure there are no conflicts
-            let new_active_file_id = file_id_gen.take_next_id();
+            let new_active_file_id = file_id_gen.take_next();
             let new_active_file_path = update_active_file_id(new_active_file_id, config)?;
             debug!("New active file is {:?}", &new_active_file_path);
 
@@ -742,7 +770,8 @@ fn maybe_seal_active_data(
     }
 }
 
-fn build_keydir(dd_contents: util::DataDirContents) -> Result<KeyDir> {
+// Returns the largest timestamp encountered, and the the fleshened keydir.
+fn build_keydir(dd_contents: util::DataDirContents) -> Result<(u64, KeyDir)> {
     info!("Making keydir");
 
     // First sort the data and hint files by file_id ascending so we process
@@ -753,6 +782,7 @@ fn build_keydir(dd_contents: util::DataDirContents) -> Result<KeyDir> {
 
     let mut keydir = KeyDir::new();
 
+    let mut max_timestamp = 0;
     for (file_id, (data_file, hint_file)) in dd_entries {
         let data_file = data_file.unwrap_or_else(|| {
             panic!(
@@ -766,45 +796,48 @@ fn build_keydir(dd_contents: util::DataDirContents) -> Result<KeyDir> {
         if let Some(hint_file) = hint_file {
             debug!("Reading hint file for file id {}", file_id);
 
-            read_hint_file_into_keydir(file_id, &hint_file, &mut keydir)
+            max_timestamp = read_hint_file_into_keydir(file_id, &hint_file, &mut keydir)
                 .chain_err(|| format!("Failed to read hint file {:?} into keydir",
                                       &hint_file))?;
 
         } else {
             debug!("Reading data file id {}", file_id);
-            read_data_file_into_keydir(file_id, &data_file, &mut keydir)
+            max_timestamp = read_data_file_into_keydir(file_id, &data_file, &mut keydir)
                 .chain_err(|| format!("Failed to read data file {:?} into keydir",
                                       &data_file))?;
         }
     }
-    Ok(keydir)
+    Ok((max_timestamp, keydir))
 }
 
 fn read_hint_file_into_keydir<P>(
     file_id: FileID,
     hint_file_path: P,
     keydir: &mut KeyDir,
-) -> io::Result<()>
+) -> io::Result<u64>
 where
     P: AsRef<Path>,
 {
 
     let mut hint_file_handle = File::open(hint_file_path.as_ref())?;
 
+    let mut max_timestamp = 0u64;
     // We receive a Some(_) when EOF hasn't been reached.
-    while let Some(_) = read_hint_file_record(file_id,
+    while let Some(ts) = read_hint_file_record(file_id,
                                               &mut hint_file_handle,
                                               keydir)?
-    { }
+    {
+        max_timestamp = ts;
+    }
 
-    Ok(())
+    Ok(max_timestamp)
 }
 
 
 // Return an Err(_) when an io error happens
 //
-// Return an Ok(Some(())) when we did not hit EOF when trying to read a record
-// (i.e., more might come)
+// Return an Ok(Some(timestamp)) when we did not hit EOF when trying to read a
+// record (i.e., more might come)
 //
 // Return an Ok(None) when we encountered an EOF when reading the first 8
 // bytes of the record (means end of stream).
@@ -816,7 +849,7 @@ fn read_hint_file_record<R>(
     file_id: FileID,
     hint_file: R,
     keydir: &mut KeyDir,
-) -> io::Result<Option<()>>
+) -> io::Result<Option<u64>>
 where
     R: Read,
 {
@@ -865,38 +898,42 @@ where
     let entry = KeyDirEntry::new(file_id, val_size, val_pos, timestamp);
     keydir.insert(key, entry);
 
-    Ok(Some(()))
+    Ok(Some(timestamp))
 }
 
 fn read_data_file_into_keydir<P>(
     file_id: FileID,
     data_file_path: P,
     keydir: &mut KeyDir,
-) -> io::Result<()>
+) -> io::Result<u64>
 where
     P: AsRef<Path>,
 {
     let mut data_file_handle = File::open(&data_file_path)?;
 
     let mut offset = 0;
-    while let Some(new_offset) = read_data_file_record_into_keydir(
+    let mut max_timestamp = 0u64;
+    while let Some((timestamp, new_offset)) = read_data_file_record_into_keydir(
         file_id,
         &mut data_file_handle,
         keydir,
         offset,
     )?
     {
+        max_timestamp = timestamp;
         offset = new_offset;
     }
-    Ok(())
+    Ok(max_timestamp)
 }
 
+// Returns the timestamp of the record just read, and the offset at which the
+// next read can begin.
 fn read_data_file_record_into_keydir<R>(
     file_id: FileID,
     data_file: R,
     keydir: &mut KeyDir,
     offset: u64,
-) -> io::Result<Option<u64>>
+) -> io::Result<Option<(u64, u64)>>
 where
     R: Read,
 {
@@ -966,7 +1003,7 @@ where
                                  timestamp);
     keydir.insert(key, entry);
 
-    Ok(Some(new_offset))
+    Ok(Some((timestamp, new_offset)))
 }
 
 
@@ -1035,26 +1072,26 @@ fn active_file_path<P: AsRef<Path>>(data_dir: P) -> Result<PathBuf> {
 fn merge_one_file(keydir: &mut KeyDir,
                   inactive_files: &mut HashMap<FileID, InactiveFile>,
                   mut data_file: InactiveFile,
+                  mutex: Arc<Mutex<()>>,
+                  clock: &mut Arc<util::LogicalClock>,
                   merge_output_file: &mut ActiveFile) -> Result<()>
 {
     debug!("Merging file {:?}", &data_file.name);
 
     'record_loop:
     while let Some(record) = BitRustDataRecord::next_from_file(&mut data_file)? {
+        std::str::from_utf8(&record.val_bytes).unwrap();
         // Name of the file that the keydir points to for this key.
-        if let Some(current_file_id) = keydir.get(&record.key_bytes)
-                                             .map(|entry| entry.file_id)
-        {
-            if current_file_id != data_file.id {
-                if current_file_id < data_file.id {
-                    panic!("Stale entry found for key {:?}. Keydir points to\
-                            file {}, but we see the key in file {} during\
-                            merge", &record.key_bytes, current_file_id, data_file.id);
-                }
-                // No need to merge, there is a newer file id that contains
-                // an updated value for this key.
+        if let Some(current_timestamp) = keydir.get(&record.key_bytes)
+                                               .map(|entry| entry.timestamp) {
+            if current_timestamp > record.timestamp {
+                // We have a newer record in the keydir
+                debug!("  Merge miss, current ts={}, our ts={}",
+                       current_timestamp, record.timestamp);
                 continue 'record_loop;
             }
+            debug!("  Merge hit, current ts={}, our ts={}",
+                   current_timestamp, record.timestamp);
             // We found the key in the keydir, and (at least for the time being)
             // the file_id pointed to from the keydir is the same as of the
             // file we are merging. So we write out the merge record to the
@@ -1077,10 +1114,10 @@ fn merge_one_file(keydir: &mut KeyDir,
             //  should erase the record we just wrote, and then continue with
             //  the merge.
             let timestamp_now = {
-                let dur_since_unix_epoch = SystemTime::now()
-                                            .duration_since(UNIX_EPOCH)
-                                            .chain_err(|| "Time drift!")?;
-                dur_since_unix_epoch.as_secs()
+                let _lock = mutex.lock().unwrap();
+                Arc::get_mut(clock)
+                    .expect("Failed to get logical timestamp generator")
+                    .take_next()
             };
 
             let new_keydir_entry = KeyDirEntry::new(merge_output_file.id,
@@ -1099,7 +1136,7 @@ fn merge_one_file(keydir: &mut KeyDir,
             if !write_successful {
                 // unwrite the record we just wrote.
                 merge_output_file.unappend(record_size as u32)
-                    .chain_err(|| "Cannont unappend record during merge!")?;
+                    .chain_err(|| format!("Could not unappend record during merge of file id {} to merge output {}", data_file.id, merge_output_file.id))?;
             }
         } else {
             // No need to merge, since the keydir does not contain this key,
@@ -1222,16 +1259,58 @@ mod tests {
 
     #[test]
     fn test_merge() {
-        let (data_dir, hint_file_path, data_file_path, guide_records) = setup();
-        let mut data_file = InactiveFile::new(data_file_path.clone()).unwrap();
-        loop {
-            let record = BitRustDataRecord::next_from_file(&mut data_file).unwrap();
-            if record.is_none() {
-                println!("EOF");
-                break;
+        //setup_logging();
+
+        let sz_limit = 100;
+        let data_dir = tempfile::tempdir().unwrap();
+        let cfg = ConfigBuilder::new(&data_dir)
+            .max_file_fize_bytes(sz_limit)
+            .build();
+
+        let mut br = BitRust::open(cfg).unwrap();
+        let keys = vec!["foo".to_string(),
+                        "bar".to_string(),
+                        "baz".to_string()];
+
+        let num_writes = 4;
+        for version in 0..num_writes {
+            for key in &keys {
+                let val = format!("{}_{:02}", key, version);
+                br.put(key.clone().into_bytes(), val.into_bytes());
             }
-            println!("{:?}", record.unwrap());
         }
+
+        debug!("Before starting merge, inactive files={:?}", br.state.inactive_files.keys().cloned().collect::<Vec<_>>());
+        {
+            debug!("Dumping active file now");
+            let mut f = InactiveFile::new(br.state.active_file.name.clone()).unwrap();
+            while let Some(record) = BitRustDataRecord::next_from_file(&mut f).unwrap() {
+                debug!("{:?}", &record);
+            };
+        }
+
+        // Trigger a merge and then assert we have the latest versions of the
+        // keys only.
+        br.merge().unwrap();
+
+        debug!("After merge, inactive files={:?}", br.state.inactive_files.keys().cloned().collect::<Vec<_>>());
+        {
+            debug!("Dumping active file now");
+            let mut f = InactiveFile::new(br.state.active_file.name.clone()).unwrap();
+            while let Some(record) = BitRustDataRecord::next_from_file(&mut f).unwrap() {
+                debug!("{:?}", &record);
+            };
+        }
+
+        for key in &keys {
+            let expected_val = format!("{}_{:02}", key, num_writes - 1).into_bytes();
+            let val = br.get(key.as_bytes()).unwrap().unwrap();
+            assert!(val == expected_val, format!("key={}, expect={}, got={}",
+                                                 key,
+                                                 std::str::from_utf8(&expected_val).unwrap(),
+                                                 std::str::from_utf8(&val).unwrap()));
+        }
+
     }
 
     #[test]
@@ -1411,6 +1490,7 @@ mod tests {
         assert!(br.state.inactive_files.len() == 0);
     }
 
+
     #[test]
     fn test_get_files_for_merging() {
         let sz_limit = 1024; // bytes
@@ -1439,8 +1519,10 @@ mod tests {
         let entry_sz: usize = 4 + 8 + 2 + 2 + key.len() + value.len();
 
         let total_entries = 256;
+        let entries_per_file = sz_limit / (entry_sz as u64);
+
         let total_open_files = (total_entries as f64 /
-                                entry_sz as f64).ceil() as usize;
+                                entries_per_file as f64).ceil() as usize;
 
         for _ in 0..total_entries {
             br.put(key.to_vec(), value.to_vec()).unwrap();
@@ -1448,7 +1530,13 @@ mod tests {
 
         let files_to_merge = br.state.get_files_for_merging();
 
-        assert!(files_to_merge.len() == total_open_files - 1);
+        assert!(files_to_merge.len() == total_open_files, "Total open files={}, merge files expected={}, merge files actual={}, record size={}, total entries={}, entries_per_file={}", total_open_files, total_open_files - 1, files_to_merge.len(), entry_sz, total_entries, entries_per_file);
+
+        for fid in files_to_merge {
+            assert!(fid.0 != br.state.active_file.id,
+                    "Merge file coverage includes active file id {}",
+                    br.state.active_file.id);
+        }
 
     }
 
