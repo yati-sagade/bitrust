@@ -1,7 +1,7 @@
-use common::{FileID};
+use common::FileID;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
 use std::hash::Hash;
+use std::sync::{Arc, RwLock};
 
 // The keydir is the main in-memory lookup table that bitcask uses, and
 // KeyDirEntry is an entry in that table (which is keyed by a String key, see
@@ -71,11 +71,9 @@ impl KeyDir {
         self.entries.keys().map(|v| &v[..]).collect()
     }
 
-    pub fn update_keydir_entry_if<P>(&mut self,
-                                     key: &Vec<u8>,
-                                     entry: KeyDirEntry,
-                                     pred: P) -> bool
-        where for<'r> P: Fn(&'r KeyDirEntry) -> bool
+    pub fn update_keydir_entry_if<P>(&mut self, key: &Vec<u8>, entry: KeyDirEntry, pred: P) -> bool
+    where
+        for<'r> P: Fn(&'r KeyDirEntry) -> bool,
     {
         let _lock = self.rwlock.write().unwrap();
         // Again to work around the stupid borrowck issues here, we delegate
@@ -86,10 +84,10 @@ impl KeyDir {
 }
 
 fn update_hashmap_if<K, KRef, V, P>(hm: &mut HashMap<K, V>, key: KRef, new_val: V, pred: P) -> bool
-    where K: Hash + Eq,
-          P: Fn(&V) -> bool,
-          KRef: AsRef<K>
-
+where
+    K: Hash + Eq,
+    P: Fn(&V) -> bool,
+    KRef: AsRef<K>,
 {
     hm.get_mut(key.as_ref()).map_or(false, |entry| {
         let should_update = pred(entry);

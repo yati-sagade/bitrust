@@ -1,9 +1,9 @@
 use std::io;
-use std::process;
 use std::path::Path;
+use std::process;
 
-use lockfile::LockFile;
 use common::BitrustOperation;
+use lockfile::LockFile;
 
 fn lock_file_base_name(op: BitrustOperation) -> String {
     String::from(match op {
@@ -12,7 +12,6 @@ fn lock_file_base_name(op: BitrustOperation) -> String {
         BitrustOperation::Merge => ".merge_lock",
     })
 }
-
 
 pub fn acquire<P>(data_dir: P, lock_type: BitrustOperation) -> io::Result<LockFile>
 where

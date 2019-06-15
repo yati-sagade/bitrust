@@ -1,11 +1,11 @@
-use std::mem;
-use std::io::{self, Write, Read};
-use std::path::{Path, PathBuf};
-use std::fs::{self, OpenOptions, File};
 use crc::crc32;
 use rand::{self, Rng};
 use regex::Regex;
 use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::mem;
+use std::path::{Path, PathBuf};
 
 use common::FileID;
 
@@ -28,7 +28,8 @@ where
 }
 
 pub fn read_from_file<P>(path: P) -> io::Result<String>
-where P: AsRef<Path>
+where
+    P: AsRef<Path>,
 {
     let mut fp = File::open(path)?;
     let mut buf = String::new();
@@ -64,7 +65,10 @@ pub struct Serial<T> {
     next: T,
 }
 
-impl<T> Serial<T> where T: std::ops::AddAssign + num::One + Clone {
+impl<T> Serial<T>
+where
+    T: std::ops::AddAssign + num::One + Clone,
+{
     pub fn new(next: T) -> Serial<T> {
         Serial { next }
     }

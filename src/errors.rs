@@ -6,4 +6,3 @@ error_chain! { // comes from crate error_chain
         }
     }
 }
-

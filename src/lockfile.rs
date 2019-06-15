@@ -1,8 +1,8 @@
+use std::fs;
 use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::io::{self, Write};
-use std::fs;
 
 #[derive(Debug)]
 pub struct LockFile {
@@ -14,15 +14,15 @@ impl LockFile {
     where
         P: AsRef<Path>,
     {
-
         {
             // create_new() translates to O_EXCL|O_CREAT being specified to the
             // underlying open() syscall on *nix (and CREATE_NEW to the
             // CreateFileW Windows API), which means that the call is successful
             // only if it is the one which created the file.
-            let mut file = OpenOptions::new().write(true).create_new(true).open(
-                path.as_ref(),
-            )?;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path.as_ref())?;
             if let Some(contents) = lockfile_contents {
                 file.write_all(contents)?;
             }
@@ -34,7 +34,9 @@ impl LockFile {
         );
         // By this time the file we created is closed, and we are sure that
         // we are the one who created it.
-        Ok(LockFile { path: path.as_ref().to_path_buf() })
+        Ok(LockFile {
+            path: path.as_ref().to_path_buf(),
+        })
     }
 }
 

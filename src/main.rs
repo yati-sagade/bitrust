@@ -1,24 +1,24 @@
 extern crate bitrust;
 #[macro_use]
 extern crate log;
-extern crate simplelog;
-extern crate getopts;
 extern crate ctrlc;
-extern crate tempfile;
+extern crate getopts;
 extern crate isatty;
+extern crate simplelog;
+extern crate tempfile;
 
-use std::time::Instant;
-use std::io::{self, Write};
 use std::env;
-use std::process;
-use std::path::{PathBuf, Path};
 use std::fs::OpenOptions;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::process;
+use std::time::Instant;
 
-use simplelog::{CombinedLogger, TermLogger, WriteLogger, LevelFilter};
-use bitrust::{BitRust, ConfigBuilder, Config};
 use bitrust::util;
+use bitrust::{BitRust, Config, ConfigBuilder};
+use simplelog::{CombinedLogger, LevelFilter, TermLogger, WriteLogger};
 
-use bitrust::{Result, Error, ErrorKind, ResultExt};
+use bitrust::{Error, ErrorKind, Result, ResultExt};
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -35,9 +35,8 @@ fn main() -> Result<()> {
 
     setup_logging(&datadir, log_level_filter(&matches))?;
 
-    let mut br = BitRust::open(config)
-                 .chain_err(|| format!("Failed to open bitrust at {:?}", &datadir))?;
-
+    let mut br =
+        BitRust::open(config).chain_err(|| format!("Failed to open bitrust at {:?}", &datadir))?;
 
     cmd_loop(&mut br)
 }
@@ -56,7 +55,9 @@ fn build_config(matches: &getopts::Matches) -> Config {
 
 fn prompt() -> Result<()> {
     print!("> ");
-    io::stdout().flush().chain_err(|| "Error displaying input prompt")?;
+    io::stdout()
+        .flush()
+        .chain_err(|| "Error displaying input prompt")?;
     Ok(())
 }
 
@@ -69,13 +70,12 @@ fn get_usage(cmd_usages: &[(&'static str, &'static str)], cmd_name: &str) -> Opt
     None
 }
 
-
 fn cmd_loop(br: &mut BitRust) -> Result<()> {
-
     ctrlc::set_handler(move || {
         println!("Type exit to quit");
         prompt().unwrap();
-    }).expect("Error setting handler");
+    })
+    .expect("Error setting handler");
 
     let cmd_usages = vec![
         ("put", "put KEY VAL\n  Store VAL into given KEY"),
@@ -128,8 +128,7 @@ fn cmd_loop(br: &mut BitRust) -> Result<()> {
             let val = cmd[2];
 
             br.put(key.as_bytes().to_vec(), val.as_bytes().to_vec())
-              .chain_err(|| "put failed")?;
-
+                .chain_err(|| "put failed")?;
         } else if cmd[0] == "get" {
             if cmd.len() != 2 {
                 println!("{}", get_usage(&cmd_usages, "get").unwrap());
@@ -142,8 +141,8 @@ fn cmd_loop(br: &mut BitRust) -> Result<()> {
             let key = cmd[1];
 
             match br.get(key.as_bytes()) {
-                e@Err(_) => println!("{:?}", e),
-                v@Ok(None) => println!("{:?}", v),
+                e @ Err(_) => println!("{:?}", e),
+                v @ Ok(None) => println!("{:?}", v),
                 Ok(Some(val)) => {
                     if let Ok(val_str) = String::from_utf8(val.clone()) {
                         let v: Result<Option<String>> = Ok(Some(val_str));
@@ -154,7 +153,6 @@ fn cmd_loop(br: &mut BitRust) -> Result<()> {
                     }
                 }
             }
-
         } else if cmd[0] == "lst" {
             for key in br.keys() {
                 if let Ok(key_str) = String::from_utf8(key.to_vec()) {
@@ -187,7 +185,8 @@ fn cmd_loop(br: &mut BitRust) -> Result<()> {
         }
     }
     info!("Exit");
-    #[allow(unreachable_code)] Ok(())
+    #[allow(unreachable_code)]
+    Ok(())
 }
 
 fn log_level_filter(matches: &getopts::Matches) -> LevelFilter {
@@ -204,33 +203,27 @@ fn log_level_filter(matches: &getopts::Matches) -> LevelFilter {
 
 fn datadir(matches: &getopts::Matches) -> PathBuf {
     matches
-    .opt_str("d")
-    .map(Into::into) // convert to PathBuf
-    .unwrap_or_else(|| {
-        env::home_dir()
-              .expect("Could not resolve $HOME, please provide -d")
-              .join("bitrust_data")
-    })
+        .opt_str("d")
+        .map(Into::into) // convert to PathBuf
+        .unwrap_or_else(|| {
+            env::home_dir()
+                .expect("Could not resolve $HOME, please provide -d")
+                .join("bitrust_data")
+        })
 }
 
 fn setup_logging<P: AsRef<Path>>(datadir: P, level_filter: LevelFilter) -> Result<()> {
     let log_file_path = datadir.as_ref().join("bitrust.log");
 
-    let log_file = OpenOptions::new().create(true).append(true).open(
-        &log_file_path,
-    )
-    .chain_err(|| format!("Could not open logfile {:?}", &log_file_path))?;
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file_path)
+        .chain_err(|| format!("Could not open logfile {:?}", &log_file_path))?;
 
     CombinedLogger::init(vec![
-        TermLogger::new(
-            LevelFilter::Warn,
-            simplelog::Config::default()
-        ).unwrap(),
-        WriteLogger::new(
-            level_filter,
-            simplelog::Config::default(),
-            log_file
-        ),
+        TermLogger::new(LevelFilter::Warn, simplelog::Config::default()).unwrap(),
+        WriteLogger::new(level_filter, simplelog::Config::default(), log_file),
     ])
     .chain_err(|| "Error setting up logging")
 }

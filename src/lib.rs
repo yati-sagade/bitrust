@@ -1,50 +1,49 @@
 #![recursion_limit = "1024"]
-
 #![feature(test)]
 extern crate byteorder;
 extern crate bytes;
 extern crate crc;
-extern crate test;
-extern crate rand;
 extern crate num;
+extern crate rand;
+extern crate test;
 
 #[macro_use]
 extern crate log;
-extern crate simplelog;
 extern crate regex;
+extern crate simplelog;
 #[macro_use]
 extern crate lazy_static;
 #[macro_use]
 extern crate error_chain;
 
-pub mod util;
-mod locking;
-mod lockfile;
-mod config;
 mod common;
+mod config;
 mod errors;
-mod storage;
 mod keydir;
+mod lockfile;
+mod locking;
+mod storage;
+pub mod util;
 
 use std::collections::HashMap;
-use std::time::{Instant};
-use std::path::{PathBuf, Path};
-use std::io::{self, Cursor};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write, Seek, SeekFrom};
+use std::io::{self, Cursor};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem;
-use std::sync::{Mutex, Arc};
+use std::path::{Path, PathBuf};
 use std::sync::atomic;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
-use bytes::{BytesMut, Bytes, BufMut, Buf};
-use byteorder::{ReadBytesExt, BigEndian};
+use byteorder::{BigEndian, ReadBytesExt};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-pub use errors::*;
+pub use common::{BitrustOperation, FileID, BITRUST_TOMBSTONE_STR};
 pub use config::*;
-pub use common::{FileID, BITRUST_TOMBSTONE_STR, BitrustOperation};
+pub use errors::*;
 
-use storage::ReadableFile;
 use keydir::{KeyDir, KeyDirEntry};
+use storage::ReadableFile;
 
 macro_rules! debug_timeit {
     ( $name:expr => $b:block ) => {{
@@ -72,7 +71,6 @@ struct ActiveFile {
 
 impl ActiveFile {
     fn new(path: PathBuf) -> io::Result<ActiveFile> {
-
         let mut write_handle = OpenOptions::new()
             .read(true)
             .append(true)
@@ -105,10 +103,10 @@ impl ActiveFile {
     }
 
     pub fn unappend(&mut self, num_bytes_to_retreat: u32) -> io::Result<u64> {
-        self.write_handle.seek(SeekFrom::Current(-(num_bytes_to_retreat as i64)))
+        self.write_handle
+            .seek(SeekFrom::Current(-(num_bytes_to_retreat as i64)))
     }
 }
-
 
 impl ReadableFile for ActiveFile {
     fn file<'a>(&'a mut self) -> io::Result<&'a mut File> {
@@ -123,22 +121,18 @@ impl ReadableFile for ActiveFile {
 }
 
 trait DataFile: ReadableFile {
-    fn read_record(&mut self, offset: usize, record_size: usize)
-            -> Result<BitRustDataRecord>
-    {
+    fn read_record(&mut self, offset: usize, record_size: usize) -> Result<BitRustDataRecord> {
         let mut read_buf = vec![0u8; record_size as usize];
         ReadableFile::read_exact(self, offset as u64, &mut read_buf)
-        .chain_err(|| format!("Error reading {} bytes at offset {}",
-                              record_size,
-                              offset))?;
+            .chain_err(|| format!("Error reading {} bytes at offset {}", record_size, offset))?;
 
         BitRustDataRecord::from_bytes(Cursor::new(read_buf))
     }
 }
 
-impl DataFile for ActiveFile { }
+impl DataFile for ActiveFile {}
 
-impl DataFile for InactiveFile { }
+impl DataFile for InactiveFile {}
 
 #[derive(Debug)]
 struct InactiveFile {
@@ -184,18 +178,21 @@ struct BitRustDataRecord {
 
 impl BitRustDataRecord {
     pub fn new(timestamp: u64, key_bytes: Vec<u8>, val_bytes: Vec<u8>) -> BitRustDataRecord {
-        BitRustDataRecord { timestamp, key_bytes, val_bytes }
+        BitRustDataRecord {
+            timestamp,
+            key_bytes,
+            val_bytes,
+        }
     }
 
     pub fn header_size() -> usize {
-           mem::size_of::<u32>()  // checksum
+        mem::size_of::<u32>()  // checksum
          + mem::size_of::<u64>()  // timestamp
          + mem::size_of::<u16>()  // key size
-         + mem::size_of::<u16>()  // value size
+         + mem::size_of::<u16>() // value size
     }
 
     pub fn as_bytes(&self) -> Bytes {
-
         let payload_size = BitRustDataRecord::header_size()
                          + self.key_bytes.len()        // key payload
                          + self.val_bytes.len()        // value payload
@@ -224,7 +221,6 @@ impl BitRustDataRecord {
     }
 
     pub fn into_bytes(self) -> Bytes {
-
         let payload_size = BitRustDataRecord::header_size()
                          + self.key_bytes.len()        // key payload
                          + self.val_bytes.len()        // value payload
@@ -258,11 +254,12 @@ impl BitRustDataRecord {
             let buf_bytes = Buf::bytes(&buf);
             let computed_checksum = util::checksum_crc32(buf_bytes);
             if computed_checksum != checksum {
-                let msg = format!("Data integrity check failed! \
-                                   record checksum={}, computed checksum={}",
-                                  checksum,
-                                  computed_checksum);
-                return Err(ErrorKind::InvalidData(msg).into())
+                let msg = format!(
+                    "Data integrity check failed! \
+                     record checksum={}, computed checksum={}",
+                    checksum, computed_checksum
+                );
+                return Err(ErrorKind::InvalidData(msg).into());
             }
         }
 
@@ -274,33 +271,40 @@ impl BitRustDataRecord {
         let (key_bytes, val_bytes) = Buf::bytes(&buf).split_at(key_size as usize);
 
         if val_bytes.len() != val_size as usize {
-            let msg = format!("Expected {} bytes for the value, but read {}",
-                               val_size,
-                               val_bytes.len());
+            let msg = format!(
+                "Expected {} bytes for the value, but read {}",
+                val_size,
+                val_bytes.len()
+            );
             return Err(ErrorKind::InvalidData(msg).into());
         }
 
-        Ok(BitRustDataRecord::new(timestamp, key_bytes.to_vec(), val_bytes.to_vec()))
+        Ok(BitRustDataRecord::new(
+            timestamp,
+            key_bytes.to_vec(),
+            val_bytes.to_vec(),
+        ))
     }
 
     // TODO: Do checksum validation
-    pub fn next_from_file<R: ReadableFile>(file: &mut R) ->
-            Result<Option<BitRustDataRecord>> {
+    pub fn next_from_file<R: ReadableFile>(file: &mut R) -> Result<Option<BitRustDataRecord>> {
         let (checksum, timestamp, key_size, val_size) = {
             let mut header_bytes = vec![0; BitRustDataRecord::header_size()];
 
-            let offset = file.tell()
-                             .chain_err(|| "Could not get current offset of\
-                                            stream for reading the next\
-                                            BitRustDataRecord")?;
+            let offset = file.tell().chain_err(|| {
+                "Could not get current offset of\
+                 stream for reading the next\
+                 BitRustDataRecord"
+            })?;
 
             let result = file.read_exact_from_current_offset(&mut header_bytes);
 
             if let Err(e) = result {
-                let new_offset = file.tell()
-                                 .chain_err(|| "Could not get current offset of\
-                                                stream for reading the next\
-                                                BitRustDataRecord")?;
+                let new_offset = file.tell().chain_err(|| {
+                    "Could not get current offset of\
+                     stream for reading the next\
+                     BitRustDataRecord"
+                })?;
 
                 if e.kind() == io::ErrorKind::UnexpectedEof && offset == new_offset {
                     // In this case, we attempted a read right at the end of the
@@ -317,34 +321,33 @@ impl BitRustDataRecord {
                 } else {
                     // Here, we read a few bytes, but reached a premature EOF
                     // before we could fleshen the full header. This is bad.
-                    return Err(e)
-                        .chain_err(|| "Error reading record header from stream");
+                    return Err(e).chain_err(|| "Error reading record header from stream");
                 };
             }
 
             let mut start = 0;
             let mut end = mem::size_of::<u32>();
             let checksum = (&header_bytes[start..end])
-                            .read_u32::<BigEndian>()
-                            .chain_err(|| "Error reading checksum from record header")?;
+                .read_u32::<BigEndian>()
+                .chain_err(|| "Error reading checksum from record header")?;
 
             start = end;
             end += mem::size_of::<u64>();
             let timestamp = (&header_bytes[start..end])
-                            .read_u64::<BigEndian>()
-                            .chain_err(|| "Error reading timestamp from record header")?;
+                .read_u64::<BigEndian>()
+                .chain_err(|| "Error reading timestamp from record header")?;
 
             start = end;
             end += mem::size_of::<u16>();
             let key_size = (&header_bytes[start..end])
-                            .read_u16::<BigEndian>()
-                            .chain_err(|| "Error reading key size from record header")?;
+                .read_u16::<BigEndian>()
+                .chain_err(|| "Error reading key size from record header")?;
 
             start = end;
             end += mem::size_of::<u16>();
             let val_size = (&header_bytes[start..end])
-                            .read_u16::<BigEndian>()
-                            .chain_err(|| "Error reading val size from record header")?;
+                .read_u16::<BigEndian>()
+                .chain_err(|| "Error reading val size from record header")?;
 
             (checksum, timestamp, key_size, val_size)
         };
@@ -362,7 +365,9 @@ impl BitRustDataRecord {
             (key_bytes.to_vec(), val_bytes.to_vec())
         };
 
-        Ok(Some(BitRustDataRecord::new(timestamp, key_bytes, val_bytes)))
+        Ok(Some(BitRustDataRecord::new(
+            timestamp, key_bytes, val_bytes,
+        )))
     }
 }
 
@@ -398,11 +403,14 @@ pub struct BitRustState {
 
 impl BitRustState {
     pub fn new(config: Config) -> Result<BitRustState> {
-
         info!("Making a bitrust");
-        fs::create_dir_all(config.datadir())
-            .chain_err(|| format!("Failed to ensure that datadir is created at {:?}\
-                                   (permission issues?)", &config.datadir()))?;
+        fs::create_dir_all(config.datadir()).chain_err(|| {
+            format!(
+                "Failed to ensure that datadir is created at {:?}\
+                 (permission issues?)",
+                &config.datadir()
+            )
+        })?;
 
         let data_dir = config.datadir().to_path_buf();
 
@@ -415,8 +423,7 @@ impl BitRustState {
         // returned BitRustState, this means the lock lives as long as the returned
         // BitRustState lives.
         let lockfile = locking::acquire(&data_dir, BitrustOperation::Write)
-                        .chain_err(|| format!("Failed to obtain write lock in {:?}",
-                                              &data_dir))?;
+            .chain_err(|| format!("Failed to obtain write lock in {:?}", &data_dir))?;
 
         debug!("Obtained data directory lock");
 
@@ -426,9 +433,13 @@ impl BitRustState {
         // hint file is optional, but cannot exist without a corresponding data
         // file (because hint files just contain pointers into the respective
         // data files)
-        let data_and_hint_files = util::get_data_and_hint_files(&data_dir)
-            .chain_err(|| format!("Failed to enumerate contents of the data dir\
-                                   {:?} when starting up bitrust", &data_dir))?;
+        let data_and_hint_files = util::get_data_and_hint_files(&data_dir).chain_err(|| {
+            format!(
+                "Failed to enumerate contents of the data dir\
+                 {:?} when starting up bitrust",
+                &data_dir
+            )
+        })?;
 
         let (latest_timestamp, keydir) = if data_and_hint_files.len() == 0 {
             // We are starting from scratch, write the name of the active file
@@ -441,16 +452,25 @@ impl BitRustState {
 
             util::write_to_file(
                 &ptr_path,
-                data_dir.join("0.data").to_str().expect(
-                    "Garbled initial data file name?",
-                ),
-            ).chain_err(|| format!("Failed to write active file name to the\
-                                    pointer file {:?}", &ptr_path))?;
+                data_dir
+                    .join("0.data")
+                    .to_str()
+                    .expect("Garbled initial data file name?"),
+            )
+            .chain_err(|| {
+                format!(
+                    "Failed to write active file name to the\
+                     pointer file {:?}",
+                    &ptr_path
+                )
+            })?;
 
             (0u64, KeyDir::new())
         } else {
-            debug!("Now building keydir with these files: {:?}",
-                   &data_and_hint_files);
+            debug!(
+                "Now building keydir with these files: {:?}",
+                &data_and_hint_files
+            );
             // We should probably build the keydir and the `active_file` and
             // `inactive_file` fields together, but it is just simpler to first
             // build the keydir and then do another pass to build the other fields.
@@ -463,16 +483,19 @@ impl BitRustState {
         debug!("Using active file {:?}", &active_file_name);
 
         let active_file = ActiveFile::new(active_file_name.clone())
-            .chain_err(|| format!("Could not open active file {:?}",
-                                  &active_file_name))?;
+            .chain_err(|| format!("Could not open active file {:?}", &active_file_name))?;
 
         let mut inactive_files = HashMap::new();
         for (file_id, (data_file, _)) in data_and_hint_files.into_iter() {
             let data_file = data_file.expect("data file path is none!");
             if file_id != active_file.id {
-                let inactive_file = InactiveFile::new(data_file.clone())
-                    .chain_err(|| format!("Failed to open inactive file at {:?} for\
-                                           reading into keydir", &data_file))?;
+                let inactive_file = InactiveFile::new(data_file.clone()).chain_err(|| {
+                    format!(
+                        "Failed to open inactive file at {:?} for\
+                         reading into keydir",
+                        &data_file
+                    )
+                })?;
 
                 inactive_files.insert(file_id, inactive_file);
             }
@@ -500,10 +523,11 @@ impl BitRustState {
     /// by `file_id`.
     fn get_files_for_merging(&self) -> Vec<(FileID, PathBuf)> {
         let datadir = self.config.datadir();
-        let mut files_to_merge: Vec<(FileID, PathBuf)> = self.inactive_files
+        let mut files_to_merge: Vec<(FileID, PathBuf)> = self
+            .inactive_files
             .keys()
             .cloned()
-            .map(|id| (id, data_file_name_from_id(id, &datadir)) )
+            .map(|id| (id, data_file_name_from_id(id, &datadir)))
             .collect();
 
         // Sort the above tuples by file id
@@ -520,17 +544,16 @@ impl BitRustState {
     // a key is seen with a tombstone, one can not just drop it, as there
     // might be a newer file that contains a non-tombstone value for the
     // key.
-    pub fn merge(&mut self) -> Result<()>
-    {
+    pub fn merge(&mut self) -> Result<()> {
         // Try to get a merge-lock on the active directory.
         // Go through the files in ascending order of ids
-        let merge_lockfile = locking::acquire(
-            &self.config.datadir(),
-            BitrustOperation::Merge
-        )
-        .chain_err(|| format!("Failed to acquire merge lock in {:?}",
-                               &self.config.datadir()))?;
-
+        let merge_lockfile = locking::acquire(&self.config.datadir(), BitrustOperation::Merge)
+            .chain_err(|| {
+                format!(
+                    "Failed to acquire merge lock in {:?}",
+                    &self.config.datadir()
+                )
+            })?;
 
         debug!("Acquired merge lockfile");
 
@@ -545,10 +568,13 @@ impl BitRustState {
             let mut merge_files = Vec::new();
             for (id, file_path) in files_to_merge.into_iter() {
                 // TODO: partial merges even if we fail to open some files.
-                let merge_file =
-                    InactiveFile::new(file_path.clone())
-                        .chain_err(|| format!("Failed to open inactive file\
-                                               {:?} for merging", &file_path))?;
+                let merge_file = InactiveFile::new(file_path.clone()).chain_err(|| {
+                    format!(
+                        "Failed to open inactive file\
+                         {:?} for merging",
+                        &file_path
+                    )
+                })?;
                 merge_files.push(merge_file);
             }
             merge_files
@@ -556,30 +582,25 @@ impl BitRustState {
 
         let datadir = self.config.datadir();
 
-
         let mut merge_output_file = {
             let mutex = self.mutex.clone();
             let merge_output_file_id = {
                 let _lock = mutex.lock().unwrap();
                 self.data_file_id_gen.take_next()
             };
-            let merge_output_file_name = data_file_name_from_id(
-                merge_output_file_id,
-                &datadir,
-            );
+            let merge_output_file_name = data_file_name_from_id(merge_output_file_id, &datadir);
 
-            let merge_active_file = ActiveFile::new(
-                merge_output_file_name.clone()
-            ).chain_err(|| "Failed to open a new merge file for writing")?;
+            let merge_active_file = ActiveFile::new(merge_output_file_name.clone())
+                .chain_err(|| "Failed to open a new merge file for writing")?;
 
             // We will also open an InactiveFile and make it known to the bitrust
             // state, since we will incrementally "port" keys from their current
             // files to the new merge file.
             let merge_inactive_file = InactiveFile::new(merge_output_file_name)
-            .chain_err(|| "Failed to open merge file for reading")?;
+                .chain_err(|| "Failed to open merge file for reading")?;
 
-            self.inactive_files.insert(merge_inactive_file.id,
-                                       merge_inactive_file);
+            self.inactive_files
+                .insert(merge_inactive_file.id, merge_inactive_file);
 
             merge_active_file
         };
@@ -590,18 +611,22 @@ impl BitRustState {
         // merging
         for data_file in merge_files.into_iter() {
             let data_file_id = data_file.id;
-            merge_one_file(&mut self.keydir,
-                           &mut self.inactive_files,
-                           data_file,
-                           self.mutex.clone(),
-                           &mut self.clock,
-                           &mut merge_output_file)?;
+            merge_one_file(
+                &mut self.keydir,
+                &mut self.inactive_files,
+                data_file,
+                self.mutex.clone(),
+                &mut self.clock,
+                &mut merge_output_file,
+            )?;
             let data_file_path = data_file_name_from_id(data_file_id, &datadir);
             debug!("Now removing {:?} after merge", &data_file_path);
-            fs::remove_file(&data_file_path)
-                .chain_err(||
-                    format!("Could not remove file {:?} after merge to file id {:?}",
-                            &data_file_path, &merge_output_file.id))?;
+            fs::remove_file(&data_file_path).chain_err(|| {
+                format!(
+                    "Could not remove file {:?} after merge to file id {:?}",
+                    &data_file_path, &merge_output_file.id
+                )
+            })?;
             self.inactive_files.remove(&data_file_id);
         }
 
@@ -609,17 +634,18 @@ impl BitRustState {
     }
 
     pub fn put(&mut self, key: Vec<u8>, val: Vec<u8>) -> Result<()> {
-
         let _lock = self.mutex.lock().unwrap();
 
         let timestamp_now = Arc::get_mut(&mut self.clock)
-                                .expect("Failed to get clock for logical timestamps")
-                                .take_next();
+            .expect("Failed to get clock for logical timestamps")
+            .take_next();
 
         let record = BitRustDataRecord::new(timestamp_now, key.clone(), val);
 
         let record_bytes = record.into_bytes();
-        let record_offset = self.active_file.append(&record_bytes)
+        let record_offset = self
+            .active_file
+            .append(&record_bytes)
             .chain_err(|| "Failed to write record to active file")?;
 
         self.keydir.insert(
@@ -634,7 +660,8 @@ impl BitRustState {
 
         debug!(
             "After this write, active file is {} bytes",
-            self.active_file.tell()
+            self.active_file
+                .tell()
                 .chain_err(|| "Failed to ftell() active file to get current offset")?
         );
 
@@ -651,42 +678,45 @@ impl BitRustState {
         let file_id_gen = &mut self.data_file_id_gen;
 
         maybe_seal_active_file(active_file, config, file_id_gen)?
-            .map(|inactive_file| {
-                inactive_files.insert(inactive_file.id, inactive_file)
-            });
+            .map(|inactive_file| inactive_files.insert(inactive_file.id, inactive_file));
 
         Ok(())
     }
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-
         let entry = self.keydir.get(key);
 
         if let Some(entry) = entry {
             let record = if entry.file_id == self.active_file.id {
                 debug!("Fetching from active file (id {})", entry.file_id);
-                self.active_file.read_record(
-                    entry.record_offset as usize,
-                    entry.record_size as usize
-                )
-                .chain_err(|| format!("Failed to read record from active file ({:?})",
-                                      &self.active_file.name))?
+                self.active_file
+                    .read_record(entry.record_offset as usize, entry.record_size as usize)
+                    .chain_err(|| {
+                        format!(
+                            "Failed to read record from active file ({:?})",
+                            &self.active_file.name
+                        )
+                    })?
             } else {
                 // if the key is not present in the store, we won't reach here
                 // (`entry` would be None). Having an entry pointing to a file
                 // we don't know about is bad.
                 debug!("Fetching from inactive file id {}", entry.file_id);
 
-                let mut file = self.inactive_files
-                   .get_mut(&entry.file_id)
-                   .ok_or(format!("Got a request for inactive file id {}, but \
-                                   it was not loaded, this is really bad!",
-                                  entry.file_id))?;
+                let mut file = self.inactive_files.get_mut(&entry.file_id).ok_or(format!(
+                    "Got a request for inactive file id {}, but \
+                     it was not loaded, this is really bad!",
+                    entry.file_id
+                ))?;
 
-                file.read_record(entry.record_offset as usize,
-                                 entry.record_size as usize)
-                    .chain_err(|| format!("Failed to read record from inactive\
-                                           file ({:?})", &file.name))?
+                file.read_record(entry.record_offset as usize, entry.record_size as usize)
+                    .chain_err(|| {
+                        format!(
+                            "Failed to read record from inactive\
+                             file ({:?})",
+                            &file.name
+                        )
+                    })?
             };
 
             // Currently deletion and the application writing the tombstone
@@ -711,9 +741,10 @@ impl BitRustState {
 }
 
 fn should_seal_active_data(active_file: &mut ActiveFile, config: &Config) -> Result<bool> {
-    active_file.tell().map(
-        |size| size >= config.max_file_fize_bytes(),
-    ).chain_err(|| "Failed to find size of active file by ftelling it")
+    active_file
+        .tell()
+        .map(|size| size >= config.max_file_fize_bytes())
+        .chain_err(|| "Failed to find size of active file by ftelling it")
 }
 
 fn data_file_name_from_id<P: AsRef<Path>>(id: FileID, datadir: P) -> PathBuf {
@@ -727,10 +758,11 @@ fn update_active_file_id(id: FileID, config: &Config) -> Result<PathBuf> {
 
     util::write_to_file(
         &ptr_path,
-        new_active_file_path.to_str().expect(
-            "Garbled data file name",
-        ),
-    ).chain_err(|| "Failed to update active file name in the pointer file")?;
+        new_active_file_path
+            .to_str()
+            .expect("Garbled data file name"),
+    )
+    .chain_err(|| "Failed to update active file name in the pointer file")?;
 
     Ok(new_active_file_path)
 }
@@ -740,7 +772,7 @@ fn update_active_file_id(id: FileID, config: &Config) -> Result<PathBuf> {
 fn maybe_seal_active_file(
     active_file: &mut ActiveFile,
     config: &Config,
-    file_id_gen: &mut util::FileIDGen
+    file_id_gen: &mut util::FileIDGen,
 ) -> Result<Option<InactiveFile>> {
     // Ultimately we want to close the current active file and start
     // writing to a new one. The pointers into the old file should still
@@ -753,11 +785,14 @@ fn maybe_seal_active_file(
             let new_active_file_path = update_active_file_id(new_active_file_id, config)?;
             debug!("New active file is {:?}", &new_active_file_path);
 
-            let mut new_active_file = ActiveFile::new(new_active_file_path.clone())
-                .chain_err(|| format!("Could not create new active file (old:\
-                                       {:?}, new: {:?})",
-                                       &active_file.name,
-                                       &new_active_file_path))?;
+            let mut new_active_file =
+                ActiveFile::new(new_active_file_path.clone()).chain_err(|| {
+                    format!(
+                        "Could not create new active file (old:\
+                         {:?}, new: {:?})",
+                        &active_file.name, &new_active_file_path
+                    )
+                })?;
 
             std::mem::swap(&mut new_active_file, active_file);
             new_active_file
@@ -797,14 +832,11 @@ fn build_keydir(dd_contents: util::DataDirContents) -> Result<(u64, KeyDir)> {
             debug!("Reading hint file for file id {}", file_id);
 
             max_timestamp = read_hint_file_into_keydir(file_id, &hint_file, &mut keydir)
-                .chain_err(|| format!("Failed to read hint file {:?} into keydir",
-                                      &hint_file))?;
-
+                .chain_err(|| format!("Failed to read hint file {:?} into keydir", &hint_file))?;
         } else {
             debug!("Reading data file id {}", file_id);
             max_timestamp = read_data_file_into_keydir(file_id, &data_file, &mut keydir)
-                .chain_err(|| format!("Failed to read data file {:?} into keydir",
-                                      &data_file))?;
+                .chain_err(|| format!("Failed to read data file {:?} into keydir", &data_file))?;
         }
     }
     Ok((max_timestamp, keydir))
@@ -818,21 +850,16 @@ fn read_hint_file_into_keydir<P>(
 where
     P: AsRef<Path>,
 {
-
     let mut hint_file_handle = File::open(hint_file_path.as_ref())?;
 
     let mut max_timestamp = 0u64;
     // We receive a Some(_) when EOF hasn't been reached.
-    while let Some(ts) = read_hint_file_record(file_id,
-                                              &mut hint_file_handle,
-                                              keydir)?
-    {
+    while let Some(ts) = read_hint_file_record(file_id, &mut hint_file_handle, keydir)? {
         max_timestamp = ts;
     }
 
     Ok(max_timestamp)
 }
-
 
 // Return an Err(_) when an io error happens
 //
@@ -853,7 +880,6 @@ fn read_hint_file_record<R>(
 where
     R: Read,
 {
-
     // XXX: Somehow using BufReader here does not work, investigate.
     let mut reader = hint_file;
 
@@ -913,12 +939,8 @@ where
 
     let mut offset = 0;
     let mut max_timestamp = 0u64;
-    while let Some((timestamp, new_offset)) = read_data_file_record_into_keydir(
-        file_id,
-        &mut data_file_handle,
-        keydir,
-        offset,
-    )?
+    while let Some((timestamp, new_offset)) =
+        read_data_file_record_into_keydir(file_id, &mut data_file_handle, keydir, offset)?
     {
         max_timestamp = timestamp;
         offset = new_offset;
@@ -937,11 +959,11 @@ fn read_data_file_record_into_keydir<R>(
 where
     R: Read,
 {
-
     let mut reader = data_file;
     let mut new_offset = offset;
 
     // Record format (top-to-bottom contiguous sequence of bytes)
+    // All numbers are laid out big-endian.
     //
     // | checksum (4 bytes)      |
     // | tstamp   (8 bytes)      |
@@ -997,15 +1019,11 @@ where
     }
     new_offset += u64::from(val_size);
 
-    let entry = KeyDirEntry::new(file_id,
-                                 (new_offset - offset) as u16,
-                                 offset,
-                                 timestamp);
+    let entry = KeyDirEntry::new(file_id, (new_offset - offset) as u16, offset, timestamp);
     keydir.insert(key, entry);
 
     Ok(Some((timestamp, new_offset)))
 }
-
 
 pub struct BitRust {
     state: BitRustState,
@@ -1065,40 +1083,49 @@ fn active_file_path<P: AsRef<Path>>(data_dir: P) -> Result<PathBuf> {
     let ptr_path = active_file_pointer_path(data_dir);
     util::read_from_file(&ptr_path)
         .map(PathBuf::from)
-        .chain_err(|| format!("Failed to read active file name from pointer file {:?}",
-                              &ptr_path))
+        .chain_err(|| {
+            format!(
+                "Failed to read active file name from pointer file {:?}",
+                &ptr_path
+            )
+        })
 }
 
-fn merge_one_file(keydir: &mut KeyDir,
-                  inactive_files: &mut HashMap<FileID, InactiveFile>,
-                  mut data_file: InactiveFile,
-                  mutex: Arc<Mutex<()>>,
-                  clock: &mut Arc<util::LogicalClock>,
-                  merge_output_file: &mut ActiveFile) -> Result<()>
-{
+fn merge_one_file(
+    keydir: &mut KeyDir,
+    inactive_files: &mut HashMap<FileID, InactiveFile>,
+    mut data_file: InactiveFile,
+    mutex: Arc<Mutex<()>>,
+    clock: &mut Arc<util::LogicalClock>,
+    merge_output_file: &mut ActiveFile,
+) -> Result<()> {
     debug!("Merging file {:?}", &data_file.name);
 
-    'record_loop:
-    while let Some(record) = BitRustDataRecord::next_from_file(&mut data_file)? {
+    'record_loop: while let Some(record) = BitRustDataRecord::next_from_file(&mut data_file)? {
         std::str::from_utf8(&record.val_bytes).unwrap();
         // Name of the file that the keydir points to for this key.
-        if let Some(current_timestamp) = keydir.get(&record.key_bytes)
-                                               .map(|entry| entry.timestamp) {
+        if let Some(current_timestamp) = keydir.get(&record.key_bytes).map(|entry| entry.timestamp)
+        {
             if current_timestamp > record.timestamp {
                 // We have a newer record in the keydir
-                debug!("  Merge miss, current ts={}, our ts={}",
-                       current_timestamp, record.timestamp);
+                debug!(
+                    "  Merge miss, current ts={}, our ts={}",
+                    current_timestamp, record.timestamp
+                );
                 continue 'record_loop;
             }
-            debug!("  Merge hit, current ts={}, our ts={}",
-                   current_timestamp, record.timestamp);
+            debug!(
+                "  Merge hit, current ts={}, our ts={}",
+                current_timestamp, record.timestamp
+            );
             // We found the key in the keydir, and (at least for the time being)
             // the file_id pointed to from the keydir is the same as of the
             // file we are merging. So we write out the merge record to the
             // output file.
             let record_bytes = record.as_bytes();
             let record_size = record_bytes.len();
-            let record_offset = merge_output_file.append(&record_bytes)
+            let record_offset = merge_output_file
+                .append(&record_bytes)
                 .chain_err(|| "Failed to write merge record")?;
             // BUT between now and us writind the record, a fresh write for the
             // key might have come in. Before we update the keydir to point
@@ -1120,17 +1147,17 @@ fn merge_one_file(keydir: &mut KeyDir,
                     .take_next()
             };
 
-            let new_keydir_entry = KeyDirEntry::new(merge_output_file.id,
-                                                    record_bytes.len() as u16,
-                                                    record_offset,
-                                                    timestamp_now);
+            let new_keydir_entry = KeyDirEntry::new(
+                merge_output_file.id,
+                record_bytes.len() as u16,
+                record_offset,
+                timestamp_now,
+            );
 
             let write_successful = keydir.update_keydir_entry_if(
                 &record.key_bytes,
                 new_keydir_entry,
-                |old_keydir_entry| {
-                    old_keydir_entry.file_id == data_file.id
-                }
+                |old_keydir_entry| old_keydir_entry.file_id == data_file.id,
             );
 
             if !write_successful {
@@ -1149,15 +1176,15 @@ fn merge_one_file(keydir: &mut KeyDir,
 #[cfg(test)]
 mod tests {
 
-    extern crate tempfile;
     extern crate simplelog;
+    extern crate tempfile;
 
-    use simplelog::{CombinedLogger, TermLogger, LevelFilter};
+    use simplelog::{CombinedLogger, LevelFilter, TermLogger};
 
-    use test::Bencher;
-    use std::io::Cursor;
     use super::*;
     use std::ffi::OsStr;
+    use std::io::Cursor;
+    use test::Bencher;
 
     fn bytes_to_utf8_string(bytes: &[u8]) -> String {
         String::from_utf8(bytes.to_vec()).unwrap()
@@ -1185,30 +1212,29 @@ mod tests {
         let key = fields[5];
         let val = fields[6];
 
-        GuideRecord{
+        GuideRecord {
             timestamp,
             file_id,
             key_size,
             val_size,
             offset,
             key: key.as_bytes().to_vec(),
-            val: val.as_bytes().to_vec()
+            val: val.as_bytes().to_vec(),
         }
     }
 
     fn setup_logging() -> io::Result<()> {
-        CombinedLogger::init(vec![
-            TermLogger::new(
-                LevelFilter::Debug,
-                simplelog::Config::default()
-            ).unwrap(),
-        ]).expect("Error setting up logging");
+        CombinedLogger::init(vec![TermLogger::new(
+            LevelFilter::Debug,
+            simplelog::Config::default(),
+        )
+        .unwrap()])
+        .expect("Error setting up logging");
 
         Ok(())
     }
 
     fn setup() -> (tempfile::TempDir, PathBuf, PathBuf, Vec<GuideRecord>) {
-
         let hint_bytes = Vec::from(&include_bytes!("../aux/0.hint")[..]);
         let data_bytes = Vec::from(&include_bytes!("../aux/0.data")[..]);
 
@@ -1219,40 +1245,38 @@ mod tests {
 
         {
             let mut file = OpenOptions::new()
-                                .create(true)
-                                .write(true)
-                                .open(&hint_file_path)
-                                .unwrap();
+                .create(true)
+                .write(true)
+                .open(&hint_file_path)
+                .unwrap();
             file.write_all(&hint_bytes[..]).unwrap();
         }
 
         {
             let mut file = OpenOptions::new()
-                                .create(true)
-                                .write(true)
-                                .open(&data_file_path)
-                                .unwrap();
+                .create(true)
+                .write(true)
+                .open(&data_file_path)
+                .unwrap();
             file.write_all(&data_bytes[..]).unwrap();
         }
 
         {
             let mut file = OpenOptions::new()
-                                .create(true)
-                                .write(true)
-                                .open(&data_dir.as_ref().join(".activefile"))
-                                .unwrap();
-            file.write_all(data_file_path
-                           .to_str()
-                           .unwrap()
-                           .as_bytes()).unwrap();
+                .create(true)
+                .write(true)
+                .open(&data_dir.as_ref().join(".activefile"))
+                .unwrap();
+            file.write_all(data_file_path.to_str().unwrap().as_bytes())
+                .unwrap();
         }
 
         let guide_str = include_str!("../aux/0.guide");
         let guide_records = guide_str
-                            .split("\n")
-                            .filter(|line| line.len() > 0)
-                            .map(parse_guide_line)
-                            .collect::<Vec<_>>();
+            .split("\n")
+            .filter(|line| line.len() > 0)
+            .map(parse_guide_line)
+            .collect::<Vec<_>>();
 
         (data_dir, hint_file_path, data_file_path, guide_records)
     }
@@ -1268,9 +1292,7 @@ mod tests {
             .build();
 
         let mut br = BitRust::open(cfg).unwrap();
-        let keys = vec!["foo".to_string(),
-                        "bar".to_string(),
-                        "baz".to_string()];
+        let keys = vec!["foo".to_string(), "bar".to_string(), "baz".to_string()];
 
         let num_writes = 4;
         for version in 0..num_writes {
@@ -1280,58 +1302,67 @@ mod tests {
             }
         }
 
-        debug!("Before starting merge, inactive files={:?}", br.state.inactive_files.keys().cloned().collect::<Vec<_>>());
+        debug!(
+            "Before starting merge, inactive files={:?}",
+            br.state.inactive_files.keys().cloned().collect::<Vec<_>>()
+        );
         {
             debug!("Dumping active file now");
             let mut f = InactiveFile::new(br.state.active_file.name.clone()).unwrap();
             while let Some(record) = BitRustDataRecord::next_from_file(&mut f).unwrap() {
                 debug!("{:?}", &record);
-            };
+            }
         }
 
         // Trigger a merge and then assert we have the latest versions of the
         // keys only.
         br.merge().unwrap();
 
-        debug!("After merge, inactive files={:?}", br.state.inactive_files.keys().cloned().collect::<Vec<_>>());
+        debug!(
+            "After merge, inactive files={:?}",
+            br.state.inactive_files.keys().cloned().collect::<Vec<_>>()
+        );
         {
             debug!("Dumping active file now");
             let mut f = InactiveFile::new(br.state.active_file.name.clone()).unwrap();
             while let Some(record) = BitRustDataRecord::next_from_file(&mut f).unwrap() {
                 debug!("{:?}", &record);
-            };
+            }
         }
 
         for key in &keys {
             let expected_val = format!("{}_{:02}", key, num_writes - 1).into_bytes();
             let val = br.get(key.as_bytes()).unwrap().unwrap();
-            assert!(val == expected_val, format!("key={}, expect={}, got={}",
-                                                 key,
-                                                 std::str::from_utf8(&expected_val).unwrap(),
-                                                 std::str::from_utf8(&val).unwrap()));
+            assert!(
+                val == expected_val,
+                format!(
+                    "key={}, expect={}, got={}",
+                    key,
+                    std::str::from_utf8(&expected_val).unwrap(),
+                    std::str::from_utf8(&val).unwrap()
+                )
+            );
         }
-
     }
 
     #[test]
     fn test_read_hintfile_into_keydir() {
-
         let (data_dir, hint_file_path, data_file_path, guide_records) = setup();
 
         let mut keydir = KeyDir::new();
 
-        read_hint_file_into_keydir(0,
-                                   &hint_file_path,
-                                   &mut keydir).unwrap();
+        read_hint_file_into_keydir(0, &hint_file_path, &mut keydir).unwrap();
 
         for guide_record in &guide_records {
             let entry = keydir.entries.remove(&guide_record.key).unwrap();
 
             assert!(entry.file_id == 0);
-            assert!(entry.record_size as usize
+            assert!(
+                entry.record_size as usize
                     == BitRustDataRecord::header_size() as usize
-                     + guide_record.val_size as usize
-                     + guide_record.key_size as usize);
+                        + guide_record.val_size as usize
+                        + guide_record.key_size as usize
+            );
             assert!(entry.record_offset == guide_record.offset);
             assert!(entry.timestamp == guide_record.timestamp);
         }
@@ -1340,44 +1371,45 @@ mod tests {
 
     #[test]
     fn test_bitrust_record_read_next_from_file() {
-
         let (data_dir, hint_file_path, data_file_path, guide_records) = setup();
 
         let mut data_file = InactiveFile::new(data_file_path.clone()).unwrap();
 
         for (idx, guide_record) in guide_records.iter().enumerate() {
-
             let record = BitRustDataRecord::next_from_file(&mut data_file)
-                            .unwrap()
-                            .unwrap();
+                .unwrap()
+                .unwrap();
 
             assert!(record.timestamp == guide_record.timestamp);
 
-            assert!(record.key_bytes == guide_record.key,
-                    "Expected key '{}' ({:?}), but found '{}' ({:?})",
-                    bytes_to_utf8_string(&guide_record.key),
-                    &guide_record.key,
-                    bytes_to_utf8_string(&record.key_bytes),
-                    &record.key_bytes);
+            assert!(
+                record.key_bytes == guide_record.key,
+                "Expected key '{}' ({:?}), but found '{}' ({:?})",
+                bytes_to_utf8_string(&guide_record.key),
+                &guide_record.key,
+                bytes_to_utf8_string(&record.key_bytes),
+                &record.key_bytes
+            );
 
-            assert!(record.val_bytes == guide_record.val,
-                    "Expected value '{}' ({:?}), but found '{}' ({:?})",
-                    bytes_to_utf8_string(&guide_record.val),
-                    &guide_record.val,
-                    bytes_to_utf8_string(&record.val_bytes),
-                    &record.val_bytes);
-
+            assert!(
+                record.val_bytes == guide_record.val,
+                "Expected value '{}' ({:?}), but found '{}' ({:?})",
+                bytes_to_utf8_string(&guide_record.val),
+                &guide_record.val,
+                bytes_to_utf8_string(&record.val_bytes),
+                &record.val_bytes
+            );
         }
         // Reading past the end should return Ok(None), but only if there was no
         // partial read -- i.e., the file should exactly end at a record, and
         // should not have garbage trailing bytes at the end.
-        assert!(BitRustDataRecord::next_from_file(&mut data_file).unwrap().is_none());
+        assert!(BitRustDataRecord::next_from_file(&mut data_file)
+            .unwrap()
+            .is_none());
     }
-
 
     #[test]
     fn test_read_datafile_into_keydir() {
-
         let (data_dir, hint_file_path, data_file_path, guide_records) = setup();
 
         let mut keydir = KeyDir::new();
@@ -1387,25 +1419,24 @@ mod tests {
         println!("keydir loaded as {:?}", &keydir.entries);
 
         for guide_record in &guide_records {
-
             let entry = keydir.entries.remove(&guide_record.key).unwrap();
 
             assert!(guide_record.file_id == 0);
             assert!(entry.file_id == guide_record.file_id);
-            assert!(entry.record_size as usize ==
-                            BitRustDataRecord::header_size() as usize
-                                       + guide_record.key_size as usize
-                                       + guide_record.val_size as usize);
+            assert!(
+                entry.record_size as usize
+                    == BitRustDataRecord::header_size() as usize
+                        + guide_record.key_size as usize
+                        + guide_record.val_size as usize
+            );
             assert!(entry.record_offset == guide_record.offset);
             assert!(entry.timestamp == guide_record.timestamp);
         }
         assert!(keydir.entries.len() == 0);
-
     }
 
     #[test]
     fn test_bitrust_state_evolution() {
-
         let sz_limit = 1_000;
 
         let data_dir = tempfile::tempdir().unwrap();
@@ -1431,50 +1462,50 @@ mod tests {
             br.put(key.to_vec(), value.to_vec()).unwrap();
         }
 
-        let expected_num_data_files = (num_entries as f64
-                                       / entry_sz as f64).ceil() as usize;
+        let expected_num_data_files = (num_entries as f64 / entry_sz as f64).ceil() as usize;
 
         let all_files = fs::read_dir(&data_dir)
-                            .unwrap()
-                            .map(|entry| entry.unwrap().path())
-                            .collect::<Vec<_>>();
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
 
         let data_files = fs::read_dir(&data_dir)
-                                .unwrap()
-                                .map(|entry| entry.unwrap())
-                                //.filter(|entry| entry.path().extension())
-                                .filter_map(|entry| {
-                                    let is_data_file =
-                                        entry.path()
-                                             .extension()
-                                             .and_then(OsStr::to_str)
-                                             .map_or(false, |s| s == "data");
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter_map(|entry| {
+                let is_data_file = entry
+                    .path()
+                    .extension()
+                    .and_then(OsStr::to_str)
+                    .map_or(false, |s| s == "data");
 
-                                    if is_data_file {
-                                        Some(data_dir.as_ref().join(entry.path()))
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect::<Vec<_>>();
+                if is_data_file {
+                    Some(data_dir.as_ref().join(entry.path()))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
 
         let active_file_pointer_path = active_file_pointer_path(&data_dir);
 
-        let persisted_active_file_name = PathBuf::from(
-            util::read_from_file(active_file_pointer_path).unwrap()
-        );
+        let persisted_active_file_name =
+            PathBuf::from(util::read_from_file(active_file_pointer_path).unwrap());
 
         assert!(persisted_active_file_name == br.state.active_file.name);
 
-        assert!(data_files.len() == expected_num_data_files,
-                format!("Expected {} data files, found {}",
-                        expected_num_data_files,
-                        data_files.len()));
+        assert!(
+            data_files.len() == expected_num_data_files,
+            format!(
+                "Expected {} data files, found {}",
+                expected_num_data_files,
+                data_files.len()
+            )
+        );
     }
 
     #[test]
     fn test_bitrust_state_init_from_scratch() {
-
         // we expect the active file to be sealed once it reaches 1kB
         let sz_limit = 1_000;
 
@@ -1489,7 +1520,6 @@ mod tests {
         assert!(br.state.keydir.entries.len() == 0);
         assert!(br.state.inactive_files.len() == 0);
     }
-
 
     #[test]
     fn test_get_files_for_merging() {
@@ -1521,8 +1551,7 @@ mod tests {
         let total_entries = 256;
         let entries_per_file = sz_limit / (entry_sz as u64);
 
-        let total_open_files = (total_entries as f64 /
-                                entries_per_file as f64).ceil() as usize;
+        let total_open_files = (total_entries as f64 / entries_per_file as f64).ceil() as usize;
 
         for _ in 0..total_entries {
             br.put(key.to_vec(), value.to_vec()).unwrap();
@@ -1533,11 +1562,12 @@ mod tests {
         assert!(files_to_merge.len() == total_open_files, "Total open files={}, merge files expected={}, merge files actual={}, record size={}, total entries={}, entries_per_file={}", total_open_files, total_open_files - 1, files_to_merge.len(), entry_sz, total_entries, entries_per_file);
 
         for fid in files_to_merge {
-            assert!(fid.0 != br.state.active_file.id,
-                    "Merge file coverage includes active file id {}",
-                    br.state.active_file.id);
+            assert!(
+                fid.0 != br.state.active_file.id,
+                "Merge file coverage includes active file id {}",
+                br.state.active_file.id
+            );
         }
-
     }
 
     #[test]
@@ -1555,9 +1585,13 @@ mod tests {
         let mut br = BitRust::open(cfg).unwrap();
 
         let key_vals = (0..1000)
-                        .map(|_| (util::rand_str().as_bytes().to_vec(),
-                                  util::rand_str().as_bytes().to_vec()))
-                        .collect::<Vec<_>>();
+            .map(|_| {
+                (
+                    util::rand_str().as_bytes().to_vec(),
+                    util::rand_str().as_bytes().to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
 
         for (key, val) in key_vals.iter().cloned() {
             br.put(key, val).unwrap();
@@ -1566,7 +1600,6 @@ mod tests {
         for (key, val) in key_vals.into_iter() {
             assert!(br.get(&key).unwrap() == Some(val));
         }
-
     }
 
     #[test]
@@ -1615,6 +1648,8 @@ mod tests {
 
         let key = util::rand_str().as_bytes().to_vec();
         let val = util::rand_str().as_bytes().to_vec();
-        b.iter(move || { br.put(key.clone(), val.clone()).unwrap(); });
+        b.iter(move || {
+            br.put(key.clone(), val.clone()).unwrap();
+        });
     }
 }

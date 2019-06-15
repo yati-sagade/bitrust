@@ -1,11 +1,10 @@
 extern crate bitrust;
 extern crate tempfile;
 
-use std::collections::HashMap;
-use bitrust::BitRustState;
 use bitrust::util::rand_str;
+use bitrust::BitRustState;
 use bitrust::ConfigBuilder;
-
+use std::collections::HashMap;
 
 #[test]
 fn test_model_based_load_store() {
@@ -25,5 +24,4 @@ fn test_model_based_load_store() {
     for (key, val) in model {
         assert!(br.get(&key).unwrap().unwrap() == val);
     }
-
 }

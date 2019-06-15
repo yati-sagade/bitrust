@@ -1,5 +1,5 @@
-use std::io::{self, Read, Seek, SeekFrom};
 use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
 
 pub trait ReadableFile {
     fn file<'a>(&'a mut self) -> io::Result<&'a mut File>;
