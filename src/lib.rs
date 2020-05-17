@@ -27,7 +27,7 @@ mod locking;
 mod storage;
 pub mod util;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -46,7 +46,7 @@ pub use config::*;
 pub use errors::*;
 
 use keydir::{KeyDir, KeyDirEntry};
-use storage::ReadableFile;
+use storage::{RecordAppender, RecordReader};
 
 macro_rules! debug_timeit {
   ( $name:expr => $b:block ) => {{
@@ -67,7 +67,7 @@ macro_rules! debug_timeit {
 #[derive(Debug)]
 struct ActiveFile {
   write_handle: File,
-  read_handle: File,
+  read_handle: BufReader<File>,
   pub name: PathBuf,
   pub id: FileID,
 }
@@ -76,88 +76,63 @@ impl ActiveFile {
   fn new(path: PathBuf) -> io::Result<ActiveFile> {
     let mut write_handle = OpenOptions::new()
       .read(true)
-      .append(true)
+      .write(true)
       .create(true)
       .open(&path)?;
-
-    let size_in_bytes = write_handle.seek(SeekFrom::End(0))? as usize;
-
-    let read_handle =
-      OpenOptions::new().read(true).create(false).open(&path)?;
-
-    let file_id = util::file_id_from_path(&path);
-
+    write_handle.seek(SeekFrom::End(0))?;
     let active_file = ActiveFile {
-      write_handle,
-      read_handle,
+      write_handle: write_handle,
+      read_handle: BufReader::new(
+        OpenOptions::new().read(true).create(false).open(&path)?,
+      ),
+      id: util::file_id_from_path(&path),
       name: path,
-      id: file_id,
     };
-
-    debug!("Initialized active file (size: {} bytes)", size_in_bytes);
-
+    debug!("Initialized active file");
     Ok(active_file)
-  }
-
-  /// Returns the offset of the first byte of written record in the file.
-  pub fn append(&mut self, bytes: &[u8]) -> io::Result<u64> {
-    let offset = self.tell()?;
-    debug!("Appended {} bytes to at offset {}", bytes.len(), offset);
-    self.write_handle.write_all(bytes).map(|_| offset)
-  }
-
-  pub fn unappend(&mut self, num_bytes_to_retreat: u32) -> io::Result<u64> {
-    self
-      .write_handle
-      .seek(SeekFrom::Current(-(num_bytes_to_retreat as i64)))
-  }
-
-  pub fn append_record(
-    &mut self,
-    record: bitrust_pb::BitRustDataRecord,
-  ) -> Result<u64> {
-    let offset = self.tell()?;
-    record
-      .write_to_writer(&mut self.write_handle)
-      .chain_err(|| "write_record")
-      .map(|_| offset)
   }
 }
 
-impl ReadableFile for ActiveFile {
-  fn file<'a>(&'a mut self) -> io::Result<&'a mut File> {
+impl RecordReader for ActiveFile {
+  type Message = bitrust_pb::BitRustDataRecord;
+  type Reader = BufReader<File>;
+  fn reader<'a>(&'a mut self) -> Result<&'a mut BufReader<File>> {
     Ok(&mut self.read_handle)
   }
+}
 
-  fn tell(&mut self) -> io::Result<u64> {
-    // the write handle is already at the end -- is there a seek still
-    // required?
-    self.write_handle.seek(SeekFrom::Current(0))
+impl RecordAppender for ActiveFile {
+  type Message = bitrust_pb::BitRustDataRecord;
+  type Writer = File;
+  fn writer<'a>(&'a mut self) -> Result<&'a mut File> {
+    Ok(&mut self.write_handle)
   }
 }
 
 #[derive(Debug)]
 struct InactiveFile {
-  read_handle: File,
+  read_handle: BufReader<File>,
   pub name: PathBuf,
   pub id: FileID,
 }
 
 impl InactiveFile {
   fn new(path: PathBuf) -> io::Result<InactiveFile> {
-    let read_handle =
-      OpenOptions::new().read(true).create(false).open(&path)?;
     let id = util::file_id_from_path(&path);
     Ok(InactiveFile {
-      read_handle: read_handle,
+      read_handle: BufReader::new(
+        OpenOptions::new().read(true).create(false).open(&path)?,
+      ),
       name: path,
       id: id,
     })
   }
 }
 
-impl ReadableFile for InactiveFile {
-  fn file<'a>(&'a mut self) -> io::Result<&'a mut File> {
+impl RecordReader for InactiveFile {
+  type Message = bitrust_pb::BitRustDataRecord;
+  type Reader = BufReader<File>;
+  fn reader<'a>(&'a mut self) -> Result<&'a mut BufReader<File>> {
     Ok(&mut self.read_handle)
   }
 }
@@ -350,7 +325,7 @@ where
   pub fn merge(&mut self) -> Result<()> {
     // Try to get a merge-lock on the active directory.
     // Go through the files in ascending order of ids
-    let merge_lockfile =
+    let _merge_lockfile =
       locking::acquire(&self.config.datadir(), BitrustOperation::Merge)
         .chain_err(|| {
           format!(
@@ -375,9 +350,8 @@ where
         let merge_file =
           InactiveFile::new(file_path.clone()).chain_err(|| {
             format!(
-              "Failed to open inactive file\
-               {:?} for merging",
-              &file_path
+              "Failed to open inactive file id {} ({:?}) for merging",
+              id, &file_path
             )
           })?;
         merge_files.push(merge_file);
@@ -413,10 +387,14 @@ where
       merge_active_file
     };
 
+    let mut all_merge_file_ids = HashSet::<FileID>::new();
+
+    all_merge_file_ids.insert(merge_output_file.id);
+
     // Read records sequentially from the file.
     // If record.key does not exist in our keydir, move on.
-    // If record.key exists, but the filename in the record does not match the file we are
-    // merging
+    // If record.key exists, but the filename in the record does not match the
+    // file we are merging
     for data_file in merge_files.into_iter() {
       let data_file_id = data_file.id;
       merge_one_file(
@@ -425,6 +403,7 @@ where
         data_file,
         self.mutex.clone(),
         &mut self.clock,
+        &all_merge_file_ids,
         &mut merge_output_file,
       )?;
       let data_file_path = data_file_name_from_id(data_file_id, &datadir);
@@ -451,23 +430,21 @@ where
     record.set_key(key.clone());
     record.set_value(val);
 
-    let record_size = record.compute_size();
-
-    let record_offset = self
+    let (offset, size) = self
       .active_file
-      .append_record(record)
+      .append_record(&record)
       .chain_err(|| "Failed to write record to active file")?;
 
-    debug!("Record written with offset {}", record_offset);
+    debug!(
+      "Record of size {} (data size ={}) written with offset {}",
+      size,
+      record.compute_size(),
+      offset
+    );
 
     self.keydir.insert(
       key,
-      KeyDirEntry::new(
-        self.active_file.id,
-        record_size as u16,
-        record_offset,
-        timestamp_now,
-      ),
+      KeyDirEntry::new(self.active_file.id, size as u16, offset, timestamp_now),
     );
 
     debug!(
@@ -485,7 +462,6 @@ where
     // This is also why maybe_seal_active_file() is a function accepting
     // our fields mutably rather than a method on &mut self.
     let inactive_files = &mut self.inactive_files;
-    let keydir = &mut self.keydir;
     let active_file = &mut self.active_file;
     let config = &self.config;
     let file_id_gen = &mut self.data_file_id_gen;
@@ -522,7 +498,7 @@ where
           // we don't know about is bad.
           debug!("Fetching from inactive file id {}", entry.file_id);
 
-          let mut file =
+          let file =
             self.inactive_files.get_mut(&entry.file_id).ok_or(format!(
               "Got a request for inactive file id {}, but \
                it was not loaded, this is really bad!",
@@ -685,7 +661,6 @@ where
   let mut max_timestamp = 0u64;
   // We receive a Some(_) when EOF hasn't been reached.
   while let Some(ts) = read_hint_file_record(file_id, hint_file, keydir)? {
-    println!("read_hint_file_record returned Ok({})", ts);
     max_timestamp = ts;
   }
   Ok(max_timestamp)
@@ -717,10 +692,6 @@ where
   }
   let hint_record =
     protobuf::parse_from_reader::<bitrust_pb::HintFileRecord>(&mut hint_file)?;
-  println!(
-    "Read record {}",
-    protobuf::text_format::print_to_string(&hint_record)
-  );
   keydir.insert(
     hint_record.get_key().to_vec(),
     KeyDirEntry::new(
@@ -858,21 +829,28 @@ fn merge_one_file<ClockT: util::LogicalClock>(
   mut data_file: InactiveFile,
   mutex: Arc<Mutex<()>>,
   clock: &mut Arc<ClockT>,
+  all_merge_file_ids: &HashSet<FileID>,
   merge_output_file: &mut ActiveFile,
 ) -> Result<()> {
   debug!("Merging file {:?}", &data_file.name);
 
   'record_loop: while let Some(record) = data_file.next_record()? {
     // Name of the file that the keydir points to for this key.
-    if let Some(current_timestamp) =
-      keydir.get(record.get_key()).map(|entry| entry.timestamp)
+    if let Some((current_timestamp, current_file_id)) = keydir
+      .get(record.get_key())
+      .map(|entry| (entry.timestamp, entry.file_id))
     {
-      if current_timestamp > record.get_timestamp() {
+      if (!all_merge_file_ids.contains(&current_file_id)
+        && current_file_id > data_file.id)
+        || current_timestamp > record.get_timestamp()
+      {
         // We have a newer record in the keydir
         debug!(
-          "  Merge miss, current ts={}, our ts={}",
+          "  Merge miss, current ts={}, our ts={}, current fid={}, our fid={}",
           current_timestamp,
-          record.get_timestamp()
+          record.get_timestamp(),
+          current_file_id,
+          data_file.id,
         );
         continue 'record_loop;
       }
@@ -882,13 +860,12 @@ fn merge_one_file<ClockT: util::LogicalClock>(
         record.get_timestamp()
       );
       let record_key = record.get_key().to_vec();
-      let record_size = record.compute_size();
       // We found the key in the keydir, and (at least for the time being)
       // the file_id pointed to from the keydir is the same as of the
       // file we are merging. So we write out the merge record to the
       // output file.
-      let record_offset = merge_output_file
-        .append_record(record)
+      let (record_offset, record_size) = merge_output_file
+        .append_record(&record)
         .chain_err(|| "Failed to write merge record")?;
       // BUT between now and us writing the record, a fresh write for the
       // key might have come in. Before we update the keydir to point
@@ -917,20 +894,44 @@ fn merge_one_file<ClockT: util::LogicalClock>(
         timestamp_now,
       );
 
+      // Update only if either:
+      // 1. The file we are currently merging (data_file) is the same id as the
+      // keydir entry for this key.
+      // 2. Or, the file id in the keydir is a previous merge file id from this
+      // merge cycle.
       let write_successful = keydir.update_keydir_entry_if(
         &record_key,
         new_keydir_entry,
-        |old_keydir_entry| old_keydir_entry.file_id == data_file.id,
+        |old_keydir_entry| {
+          data_file.id == old_keydir_entry.file_id
+            || all_merge_file_ids.contains(&old_keydir_entry.file_id)
+        },
       );
 
       if !write_successful {
         // unwrite the record we just wrote.
-        merge_output_file.unappend(record_size as u32)
-                    .chain_err(|| format!("Could not unappend record during merge of file id {} to merge output {}", data_file.id, merge_output_file.id))?;
+        debug!(
+          "*** Concurrent write to a key being merged detected, unmerging\
+          record {:?}",
+          &record
+        );
+        merge_output_file
+          .retreat(record_size as u64)
+          .chain_err(|| {
+            format!(
+              "Could not unappend record during merge of file id {} to merge \
+              output {}",
+              data_file.id, merge_output_file.id
+            )
+          })?;
       }
     } else {
       // No need to merge, since the keydir does not contain this key,
       // which means the key was deleted.
+      debug!(
+        "Skipping the merge of key {:?} since it was not found in the keydir",
+        &record.get_key()
+      );
     }
   }
   Ok(())
@@ -988,15 +989,15 @@ mod tests {
     }
   }
 
-  fn setup_logging() -> io::Result<()> {
+  fn setup_logging() -> Result<()> {
     CombinedLogger::init(vec![TermLogger::new(
       LevelFilter::Debug,
       simplelog::Config::default(),
     )
     .unwrap()])
-    .expect("Error setting up logging");
-
-    Ok(())
+    .chain_err(|| "Error setting up logging")
+    .map(|_| ())
+    .map_err(|e| e.into())
   }
 
   fn setup() -> (tempfile::TempDir, PathBuf, PathBuf, Vec<GuideRecord>) {
@@ -1067,8 +1068,38 @@ mod tests {
   }
 
   #[test]
+  fn test_active_file_retreat() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let mut f =
+      ActiveFile::new(data_dir.as_ref().join("0")).expect("Active file");
+
+    let mut rec = bitrust_pb::BitRustDataRecord::new();
+    rec.set_timestamp(42);
+    rec.set_key(b"k".to_vec());
+    rec.set_value(b"v".to_vec());
+
+    let (_, size) = f
+      .append_record(&rec)
+      .expect("Appending record should succeed");
+    f.retreat(size).expect("Retreating should succeed");
+
+    let mut rec = bitrust_pb::BitRustDataRecord::new();
+    rec.set_timestamp(42);
+    rec.set_key(b"k2".to_vec());
+    rec.set_value(b"v2".to_vec());
+    f.append_record(&rec)
+      .expect("Appending record after retreat should succeed");
+
+    let read_rec = f
+      .record_at_offset(0)
+      .expect("Read record after retreat and write")
+      .expect("Some record");
+    assert!(read_rec == rec, "Expected {:?}, got {:?}", rec, read_rec);
+  }
+
+  #[test]
   fn test_merge() {
-    setup_logging().unwrap();
+    if let Ok(_) = setup_logging() {}
     let sz_limit = 100;
     let data_dir = tempfile::tempdir().unwrap();
     let cfg = ConfigBuilder::new(&data_dir)
@@ -1084,49 +1115,14 @@ mod tests {
         br.put(key.clone().into_bytes(), val.into_bytes()).unwrap();
       }
     }
-    println!(
-      "Before starting merge, inactive files={:?}",
-      br.state.inactive_files.keys().cloned().collect::<Vec<_>>()
-    );
-    {
-      println!("Dumping inactive files");
-      for (file_id, file) in &br.state.inactive_files {
-        let mut f = BufReader::new(File::open(file.name.clone()).unwrap());
-        println!("File id {}", file_id);
-        loop {
-          if f.fill_buf().unwrap().is_empty() {
-            println!("End of file id {}", file_id);
-            break;
-          }
-          println!("Reading next record");
-          let rec: bitrust_pb::BitRustDataRecord =
-            protobuf::parse_from_reader(&mut f).unwrap();
-          println!("{:?}", &rec);
-        }
-      }
-      println!("Dumping active file now");
-      let mut f = InactiveFile::new(br.state.active_file.name.clone()).unwrap();
-      while let Some(record) = f.next_record().unwrap() {
-        println!("{:?}", &record);
-      }
-    }
-
     // Trigger a merge and then assert we have the latest versions of the
     // keys only.
     br.merge().unwrap();
-
-    println!(
-      "After merge, inactive files={:?}",
-      br.state.inactive_files.keys().cloned().collect::<Vec<_>>()
+    debug!(
+      "After merge, inactive files={:?}, keydir={:?}",
+      br.state.inactive_files.keys().cloned().collect::<Vec<_>>(),
+      &br.state.keydir,
     );
-    {
-      println!("Dumping active file now");
-      let mut f = InactiveFile::new(br.state.active_file.name.clone()).unwrap();
-      while let Some(record) = f.next_record().expect("Failed to read record") {
-        println!("{:?}", &record);
-      }
-    }
-
     for key in &keys {
       let expected_val = format!("{}_{:02}", key, num_writes - 1).into_bytes();
       let val = br.get(key.as_bytes()).unwrap().unwrap();
@@ -1155,12 +1151,12 @@ mod tests {
       hint_record.write_to_writer(&mut cursor).unwrap();
       hint_records.push(hint_record);
     }
-    println!("Done preparing test_read_hintfile_into_keydir records");
+    debug!("Done preparing test_read_hintfile_into_keydir records");
     cursor.set_position(0);
     let mut keydir = KeyDir::new();
     read_hint_file_into_keydir(0, &mut cursor, &mut keydir).unwrap();
 
-    println!("On to asserting now");
+    debug!("On to asserting now");
     for hint_record in hint_records.into_iter() {
       let keydir_entry = keydir.get(hint_record.get_key());
       assert!(keydir_entry.is_some(), "Expected to find keydir entry");
@@ -1191,7 +1187,7 @@ mod tests {
     cursor.set_position(0);
     let mut keydir = KeyDir::new();
     read_data_file_into_keydir(0, &mut cursor, &mut keydir).unwrap();
-    println!("keydir loaded as {:?}", &keydir.entries);
+    debug!("keydir loaded as {:?}", &keydir.entries);
     assert!(keydir.entries.len() == data_records.len());
     for ((offset, size), data_record) in
       offsets_and_sizes.into_iter().zip(data_records.into_iter())
@@ -1224,7 +1220,7 @@ mod tests {
     proto_record.set_timestamp(clock.tick());
     proto_record.set_key(b"somekey".to_vec());
     proto_record.set_value(b"somevalue".to_vec());
-    let entry_sz = proto_record.compute_size();
+    let entry_sz = storage::payload_size_for_record(&proto_record);
 
     let num_entries = 1000;
 
@@ -1313,7 +1309,7 @@ mod tests {
     proto_record.set_timestamp(clock.tick());
     proto_record.set_key(b"somekey".to_vec());
     proto_record.set_value(b"somevalue".to_vec());
-    let entry_sz = proto_record.compute_size();
+    let entry_sz = storage::payload_size_for_record(&proto_record);
 
     let total_entries = 256;
     let entries_per_file = sz_limit / (entry_sz as u64);
@@ -1384,7 +1380,7 @@ mod tests {
 
   #[test]
   fn test_creation() {
-    //setup_logging();
+    setup_logging().unwrap();
     let data_dir = tempfile::tempdir().unwrap();
 
     let cfg = ConfigBuilder::new(&data_dir).build();

@@ -15,6 +15,17 @@ const RECORD_SIZE_OFFSET: usize = 0;
 const RECORD_SIZE_CRC_OFFSET: usize = 8;
 const RECORD_DATA_OFFSET: usize = 12;
 
+/// Returns the size of the given message, when stored. Currently there is a
+/// constant overhead of 16 bytes (8 bytes for message size, 4 bytes for message
+/// size CRC32, 4 bytes for data CRC32).
+#[inline(always)]
+pub fn payload_size_for_record<M>(msg: &M) -> u64
+where
+  M: protobuf::Message,
+{
+  msg.compute_size() as u64 + 16
+}
+
 /// A trait for sequential and random read access to recordio logs. Each payload
 /// in a log is laid out as follows:
 ///   
@@ -104,7 +115,50 @@ pub trait RecordReader {
     self.reader()?.seek(SeekFrom::Start(offset_from_start))?;
     self.next_record()
   }
+
+  /// Seeks to `offset_from_start`, reads `payload_size` bytes, and attempts to
+  /// read a log record from these bytes. If the payload size is known in advance, this can be faster
+  /// than record_at_offset(), which first has to read the record size.
+  fn read_record(
+    &mut self,
+    offset_from_start: u64,
+    payload_size: u64,
+  ) -> Result<Self::Message> {
+    let mut payload = vec![0u8; payload_size as usize];
+    self.read_exact(offset_from_start, &mut payload)?;
+    let mut record_size_slice =
+      &payload[RECORD_SIZE_OFFSET..RECORD_SIZE_CRC_OFFSET];
+    let record_size_slice_crc = util::checksum_crc32(record_size_slice);
+    let record_size = record_size_slice
+      .read_u64::<BigEndian>()
+      .chain_err(|| format!("Error reading record size from bytes"))?;
+    let record_size_crc = (&payload
+      [RECORD_SIZE_CRC_OFFSET..RECORD_DATA_OFFSET])
+      .read_u32::<BigEndian>()
+      .chain_err(|| format!("Error reading record size CRC from bytes"))?;
+    if record_size_slice_crc != record_size_crc {
+      return Err(
+        ErrorKind::InvalidData("CRC failed for record size".to_string()).into(),
+      );
+    }
+    let record_data_crc_offset = RECORD_DATA_OFFSET + record_size as usize;
+    let record_data = &payload[RECORD_DATA_OFFSET..record_data_crc_offset];
+    let data_crc =
+      (&payload[record_data_crc_offset..]).read_u32::<BigEndian>()?;
+    if util::checksum_crc32(record_data) != data_crc {
+      return Err(
+        ErrorKind::InvalidData("CRC failed for record data".to_string()).into(),
+      );
+    }
+    protobuf::parse_from_bytes::<Self::Message>(record_data)
+      .chain_err(|| "Error reading message body from bytes")
+      .map_err(|e| e.into())
+  }
 }
+
+// Start offset and size of the written payload (which includes record size and
+// CRCs).
+pub type AppendRecordResult = Result<(u64, u64)>;
 
 pub trait RecordAppender {
   type Writer: Write + Seek;
@@ -123,12 +177,13 @@ pub trait RecordAppender {
       .map_err(|e| e.into())
   }
 
-  /// Appends the given `record` to self.writer() and returns the starting
-  /// offset of the record. So for the very first record appended, this offset
-  /// is 0.
-  fn append_record(&mut self, record: &Self::Message) -> Result<u64> {
+  /// Appends the given `record` to self.writer() and returns the starting offset
+  /// of the record, and the total size of the payload. So for the very first
+  /// record appended, this offset is 0. Currently the size overhead is 16 bytes
+  /// per record.
+  fn append_record(&mut self, record: &Self::Message) -> AppendRecordResult {
     let offset = self.tell()?;
-    let payload_size_bytes = 16 + record.compute_size();
+    let payload_size_bytes = payload_size_for_record(record);
     let mut payload = BytesMut::with_capacity(payload_size_bytes as usize);
     payload.put_u64_be(record.compute_size() as u64);
     let record_size_crc = util::checksum_crc32(&payload[..8]);
@@ -141,12 +196,13 @@ pub trait RecordAppender {
       .writer()?
       .write_all(&payload)
       .map_err(|e| e.into())
-      .map(|_| offset)
+      .map(|_| (offset, payload.len() as u64))
   }
 
   /// Retreats the writer `bytes_to_retreat` bytes back. This is useful for
   /// "unappending" a log record, but only if its size is known.
   fn retreat(&mut self, bytes_to_retreat: u64) -> Result<u64> {
+    self.writer()?.flush()?;
     self
       .writer()?
       .seek(SeekFrom::Current(-(bytes_to_retreat as i64)))
@@ -154,65 +210,13 @@ pub trait RecordAppender {
   }
 }
 
-pub trait ReadableFile {
-  fn file<'a>(&'a mut self) -> io::Result<&'a mut File>;
-
-  fn read_exact(
-    &mut self,
-    offset_from_start: u64,
-    bytes: &mut [u8],
-  ) -> io::Result<()> {
-    let fp = self.file()?;
-    fp.seek(SeekFrom::Start(offset_from_start))?;
-    fp.read_exact(bytes)
-  }
-
-  fn read_exact_from_current_offset(
-    &mut self,
-    bytes: &mut [u8],
-  ) -> io::Result<()> {
-    let fp = self.file()?;
-    fp.read_exact(bytes)
-  }
-
-  // TODO: Provide more efficient implementation for tell() by keeping track
-  // of write offsets.
-  fn tell(&mut self) -> io::Result<u64> {
-    let fp = self.file()?;
-    fp.seek(SeekFrom::Current(0))
-  }
-
-  fn next_record(&mut self) -> Result<Option<BitRustDataRecord>> {
-    let result =
-      protobuf::parse_from_reader::<BitRustDataRecord>(self.file()?)?;
-    Ok(if result.compute_size() == 0 {
-      None
-    } else {
-      Some(result)
-    })
-  }
-
-  fn read_record(
-    &mut self,
-    offset_from_start: u64,
-    record_size: u64,
-  ) -> Result<BitRustDataRecord> {
-    let mut bytes = vec![0u8; record_size as usize];
-    self.read_exact(offset_from_start, &mut bytes)?;
-    protobuf::parse_from_bytes(&bytes[..]).chain_err(|| "Error reading record")
-  }
-}
-
 #[cfg(test)]
-mod record_reader_tests {
+mod test_utils {
   use super::*;
-  extern crate simplelog;
-  extern crate tempfile;
-  use bytes::{BufMut, BytesMut};
   use std::io::Cursor;
 
-  struct CursorBasedReader<T> {
-    cursor: Cursor<T>,
+  pub struct CursorBasedReader<T> {
+    pub cursor: Cursor<T>,
   }
 
   impl<T: AsRef<[u8]>> RecordReader for CursorBasedReader<T> {
@@ -223,6 +227,30 @@ mod record_reader_tests {
       Ok(&mut self.cursor)
     }
   }
+
+  pub struct CursorBasedWriter {
+    pub cursor: Cursor<Vec<u8>>,
+  }
+
+  impl RecordAppender for CursorBasedWriter {
+    type Message = BitRustDataRecord;
+    type Writer = Cursor<Vec<u8>>;
+
+    fn writer<'a>(&'a mut self) -> Result<&'a mut Cursor<Vec<u8>>> {
+      Ok(&mut self.cursor)
+    }
+  }
+}
+
+#[cfg(test)]
+mod record_reader_tests {
+  use super::*;
+  extern crate simplelog;
+  extern crate tempfile;
+  use super::test_utils::*;
+  use byteorder::{BigEndian, ByteOrder};
+  use bytes::{BufMut, BytesMut};
+  use std::io::Cursor;
 
   #[test]
   fn test_next_record_fails_for_incomplete_data_at_end() {
@@ -283,27 +311,129 @@ mod record_reader_tests {
       format!("Expected None, got {:?}", record_from_cursor)
     );
   }
+
+  #[test]
+  fn test_read_record_works() {
+    let mut rec = BitRustDataRecord::new();
+    rec.set_timestamp(42);
+    rec.set_key(b"k".to_vec());
+    rec.set_value(b"v".to_vec());
+
+    let mut expected_buf = vec![0u8; payload_size_for_record(&rec) as usize];
+    BigEndian::write_u64(
+      &mut expected_buf[RECORD_SIZE_OFFSET..RECORD_SIZE_CRC_OFFSET],
+      rec.compute_size() as u64,
+    );
+    let rec_size_crc = util::checksum_crc32(
+      &expected_buf[RECORD_SIZE_OFFSET..RECORD_SIZE_CRC_OFFSET],
+    );
+    BigEndian::write_u32(
+      &mut expected_buf[RECORD_SIZE_CRC_OFFSET..RECORD_DATA_OFFSET],
+      rec_size_crc,
+    );
+    let rec_data = rec.write_to_bytes().expect("Vector of bytes");
+    let record_data_crc_offset =
+      RECORD_DATA_OFFSET + rec.compute_size() as usize;
+    expected_buf[RECORD_DATA_OFFSET..record_data_crc_offset]
+      .copy_from_slice(&rec_data);
+    BigEndian::write_u32(
+      &mut expected_buf[record_data_crc_offset..],
+      util::checksum_crc32(&rec_data),
+    );
+
+    let mut buf_with_padding = vec![0u8; expected_buf.len() + 2];
+    buf_with_padding[1..expected_buf.len() + 1].copy_from_slice(&expected_buf);
+
+    let mut reader = CursorBasedReader {
+      cursor: Cursor::new(buf_with_padding),
+    };
+
+    let read_rec = reader
+      .read_record(1, expected_buf.len() as u64)
+      .expect("Non-error record");
+    assert!(read_rec == rec);
+  }
+
+  #[test]
+  fn test_read_record_fails_for_invalid_payload_spec() {
+    let mut rec = BitRustDataRecord::new();
+    rec.set_timestamp(42);
+    rec.set_key(b"k".to_vec());
+    rec.set_value(b"v".to_vec());
+
+    let mut expected_buf = vec![0u8; payload_size_for_record(&rec) as usize];
+    BigEndian::write_u64(
+      &mut expected_buf[RECORD_SIZE_OFFSET..RECORD_SIZE_CRC_OFFSET],
+      rec.compute_size() as u64,
+    );
+    let rec_size_crc = util::checksum_crc32(
+      &expected_buf[RECORD_SIZE_OFFSET..RECORD_SIZE_CRC_OFFSET],
+    );
+    BigEndian::write_u32(
+      &mut expected_buf[RECORD_SIZE_CRC_OFFSET..RECORD_DATA_OFFSET],
+      rec_size_crc,
+    );
+    let rec_data = rec.write_to_bytes().expect("Vector of bytes");
+    let record_data_crc_offset =
+      RECORD_DATA_OFFSET + rec.compute_size() as usize;
+    expected_buf[RECORD_DATA_OFFSET..record_data_crc_offset]
+      .copy_from_slice(&rec_data);
+    BigEndian::write_u32(
+      &mut expected_buf[record_data_crc_offset..],
+      util::checksum_crc32(&rec_data),
+    );
+
+    let mut buf_with_padding = vec![0u8; expected_buf.len() + 2];
+    buf_with_padding[1..expected_buf.len() + 1].copy_from_slice(&expected_buf);
+
+    let mut reader = CursorBasedReader {
+      cursor: Cursor::new(buf_with_padding),
+    };
+
+    let read_rec = reader.read_record(0, expected_buf.len() as u64);
+    assert!(read_rec.is_err(), "Expected error, got {:?}", read_rec);
+  }
 }
 
 #[cfg(test)]
-mod record_appended_tests {
+mod record_appender_tests {
+  use super::test_utils::*;
   use super::*;
   extern crate simplelog;
   extern crate tempfile;
   use byteorder::{BigEndian, ByteOrder};
   use std::io::Cursor;
 
-  struct CursorBasedWriter {
-    cursor: Cursor<Vec<u8>>,
-  }
+  #[test]
+  fn test_retreat_works() {
+    let mut rec = BitRustDataRecord::new();
+    rec.set_timestamp(42);
+    rec.set_key(b"k".to_vec());
+    rec.set_value(b"v".to_vec());
 
-  impl RecordAppender for CursorBasedWriter {
-    type Message = BitRustDataRecord;
-    type Writer = Cursor<Vec<u8>>;
+    let mut writer = CursorBasedWriter {
+      cursor: Cursor::new(vec![]),
+    };
+    let (offset, size) = writer.append_record(&rec).expect("Writing record");
+    assert!((offset, size) == (0, payload_size_for_record(&rec)));
+    writer.retreat(size).expect("Retreat should succeed");
 
-    fn writer<'a>(&'a mut self) -> Result<&'a mut Cursor<Vec<u8>>> {
-      Ok(&mut self.cursor)
-    }
+    let mut rec = BitRustDataRecord::new();
+    rec.set_timestamp(42);
+    rec.set_key(b"k2".to_vec());
+    rec.set_value(b"v2".to_vec());
+    writer
+      .append_record(&rec)
+      .expect("Writing record after retreat");
+
+    let mut reader = CursorBasedReader {
+      cursor: Cursor::new(writer.cursor.into_inner()),
+    };
+    let read_rec = reader
+      .next_record()
+      .expect("Read record")
+      .expect("Some record");
+    assert!(read_rec == rec);
   }
 
   #[test]
@@ -316,11 +446,14 @@ mod record_appended_tests {
     let mut writer = CursorBasedWriter {
       cursor: Cursor::new(vec![]),
     };
-    writer
-      .append_record(&rec)
-      .expect("Writing record should succeed");
+    assert!(
+      writer
+        .append_record(&rec)
+        .expect("Writing record should succeed")
+        == (0, payload_size_for_record(&rec))
+    );
 
-    let mut expected_buf = vec![0u8; (rec.compute_size() + 16) as usize];
+    let mut expected_buf = vec![0u8; payload_size_for_record(&rec) as usize];
     BigEndian::write_u64(
       &mut expected_buf[RECORD_SIZE_OFFSET..RECORD_SIZE_CRC_OFFSET],
       rec.compute_size() as u64,
