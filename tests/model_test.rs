@@ -1,7 +1,7 @@
 extern crate bitrust;
 extern crate tempfile;
 
-use bitrust::util::{rand_str, LogicalClock, SerialLogicalClock};
+use bitrust::util::{rand_str, SerialLogicalClock};
 use bitrust::BitRustState;
 use bitrust::ConfigBuilder;
 use std::collections::HashMap;

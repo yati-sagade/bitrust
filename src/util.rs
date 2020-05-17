@@ -1,6 +1,5 @@
 use crc::crc32;
 use rand::{self, Rng};
-use regex::Regex;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};

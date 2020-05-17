@@ -10,10 +10,9 @@ extern crate test;
 
 #[macro_use]
 extern crate log;
+extern crate lazy_static;
 extern crate regex;
 extern crate simplelog;
-#[macro_use]
-extern crate lazy_static;
 #[macro_use]
 extern crate error_chain;
 
@@ -29,16 +28,12 @@ pub mod util;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Cursor};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::mem;
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use byteorder::{BigEndian, ReadBytesExt};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
 use protobuf::Message;
 
 pub use common::{BitrustOperation, FileID, BITRUST_TOMBSTONE_STR};
@@ -399,7 +394,6 @@ where
       let data_file_id = data_file.id;
       merge_one_file(
         &mut self.keydir,
-        &mut self.inactive_files,
         data_file,
         self.mutex.clone(),
         &mut self.clock,
@@ -825,7 +819,6 @@ fn active_file_path<P: AsRef<Path>>(data_dir: P) -> Result<PathBuf> {
 
 fn merge_one_file<ClockT: util::LogicalClock>(
   keydir: &mut KeyDir,
-  inactive_files: &mut HashMap<FileID, InactiveFile>,
   mut data_file: InactiveFile,
   mutex: Arc<Mutex<()>>,
   clock: &mut Arc<ClockT>,
@@ -952,43 +945,7 @@ mod tests {
   use test::Bencher;
   use util::LogicalClock;
 
-  fn bytes_to_utf8_string(bytes: &[u8]) -> String {
-    String::from_utf8(bytes.to_vec()).unwrap()
-  }
-
-  #[derive(Debug)]
-  struct GuideRecord {
-    timestamp: u64,
-    file_id: FileID,
-    key_size: u16,
-    val_size: u16,
-    offset: u64,
-    key: Vec<u8>,
-    val: Vec<u8>,
-  }
-
-  fn parse_guide_line(line: &str) -> GuideRecord {
-    let fields = line.split(",").collect::<Vec<_>>();
-
-    let timestamp = fields[0].parse::<u64>().unwrap();
-    let file_id = fields[1].parse::<FileID>().unwrap();
-    let key_size = fields[2].parse::<u16>().unwrap();
-    let val_size = fields[3].parse::<u16>().unwrap();
-    let offset = fields[4].parse::<u64>().unwrap();
-    let key = fields[5];
-    let val = fields[6];
-
-    GuideRecord {
-      timestamp,
-      file_id,
-      key_size,
-      val_size,
-      offset,
-      key: key.as_bytes().to_vec(),
-      val: val.as_bytes().to_vec(),
-    }
-  }
-
+  #[allow(dead_code)]
   fn setup_logging() -> Result<()> {
     CombinedLogger::init(vec![TermLogger::new(
       LevelFilter::Debug,
@@ -998,54 +955,6 @@ mod tests {
     .chain_err(|| "Error setting up logging")
     .map(|_| ())
     .map_err(|e| e.into())
-  }
-
-  fn setup() -> (tempfile::TempDir, PathBuf, PathBuf, Vec<GuideRecord>) {
-    let hint_bytes = Vec::from(&include_bytes!("../aux/0.hint")[..]);
-    let data_bytes = Vec::from(&include_bytes!("../aux/0.data")[..]);
-
-    let data_dir = tempfile::tempdir().unwrap();
-
-    let hint_file_path = data_dir.as_ref().join("0.hint");
-    let data_file_path = data_dir.as_ref().join("0.data");
-
-    {
-      let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&hint_file_path)
-        .unwrap();
-      file.write_all(&hint_bytes[..]).unwrap();
-    }
-
-    {
-      let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&data_file_path)
-        .unwrap();
-      file.write_all(&data_bytes[..]).unwrap();
-    }
-
-    {
-      let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&data_dir.as_ref().join(".activefile"))
-        .unwrap();
-      file
-        .write_all(data_file_path.to_str().unwrap().as_bytes())
-        .unwrap();
-    }
-
-    let guide_str = include_str!("../aux/0.guide");
-    let guide_records = guide_str
-      .split("\n")
-      .filter(|line| line.len() > 0)
-      .map(parse_guide_line)
-      .collect::<Vec<_>>();
-
-    (data_dir, hint_file_path, data_file_path, guide_records)
   }
 
   struct MockClock {
@@ -1099,7 +1008,6 @@ mod tests {
 
   #[test]
   fn test_merge() {
-    if let Ok(_) = setup_logging() {}
     let sz_limit = 100;
     let data_dir = tempfile::tempdir().unwrap();
     let cfg = ConfigBuilder::new(&data_dir)
@@ -1235,11 +1143,6 @@ mod tests {
     let expected_num_data_files =
       (entry_sz as f64 * num_entries as f64 / sz_limit as f64).ceil() as usize;
 
-    let all_files = fs::read_dir(&data_dir)
-      .unwrap()
-      .map(|entry| entry.unwrap().path())
-      .collect::<Vec<_>>();
-
     let data_files = fs::read_dir(&data_dir)
       .unwrap()
       .map(|entry| entry.unwrap())
@@ -1285,7 +1188,7 @@ mod tests {
       .max_file_fize_bytes(sz_limit)
       .build();
 
-    let mut br = BitRust::open(cfg, MockClock::new()).unwrap();
+    let br = BitRust::open(cfg, MockClock::new()).unwrap();
 
     assert!(br.state.active_file.name == data_dir.as_ref().join("0.data"));
     assert!(br.state.keydir.entries.len() == 0);
@@ -1380,7 +1283,6 @@ mod tests {
 
   #[test]
   fn test_creation() {
-    setup_logging().unwrap();
     let data_dir = tempfile::tempdir().unwrap();
 
     let cfg = ConfigBuilder::new(&data_dir).build();

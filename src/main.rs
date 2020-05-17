@@ -2,6 +2,7 @@ extern crate bitrust;
 #[macro_use]
 extern crate log;
 extern crate ctrlc;
+extern crate dirs;
 extern crate getopts;
 extern crate isatty;
 extern crate simplelog;
@@ -12,13 +13,12 @@ use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::time::Instant;
 
 use bitrust::util;
 use bitrust::{BitRust, Config, ConfigBuilder};
 use simplelog::{CombinedLogger, LevelFilter, TermLogger, WriteLogger};
 
-use bitrust::{Error, ErrorKind, Result, ResultExt};
+use bitrust::{Result, ResultExt};
 
 fn main() -> Result<()> {
   let args: Vec<String> = env::args().collect();
@@ -211,7 +211,7 @@ fn datadir(matches: &getopts::Matches) -> PathBuf {
     .opt_str("d")
     .map(Into::into) // convert to PathBuf
     .unwrap_or_else(|| {
-      env::home_dir()
+      dirs::home_dir()
         .expect("Could not resolve $HOME, please provide -d")
         .join("bitrust_data")
     })

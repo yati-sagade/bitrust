@@ -1,7 +1,5 @@
-use std::fs::File;
-use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 
-use bitrust_pb::BitRustDataRecord;
 use byteorder::{BigEndian, ReadBytesExt};
 use bytes::{BufMut, BytesMut};
 use errors::*;
@@ -213,6 +211,7 @@ pub trait RecordAppender {
 #[cfg(test)]
 mod test_utils {
   use super::*;
+  use bitrust_pb::BitRustDataRecord;
   use std::io::Cursor;
 
   pub struct CursorBasedReader<T> {
@@ -245,6 +244,7 @@ mod test_utils {
 #[cfg(test)]
 mod record_reader_tests {
   use super::*;
+  use bitrust_pb::BitRustDataRecord;
   extern crate simplelog;
   extern crate tempfile;
   use super::test_utils::*;
@@ -399,6 +399,7 @@ mod record_reader_tests {
 mod record_appender_tests {
   use super::test_utils::*;
   use super::*;
+  use bitrust_pb::BitRustDataRecord;
   extern crate simplelog;
   extern crate tempfile;
   use byteorder::{BigEndian, ByteOrder};
