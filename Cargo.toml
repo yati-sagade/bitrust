@@ -3,6 +3,9 @@ name = "bitrust"
 version = "0.1.0"
 authors = ["Yati Sagade <mail@ysagade.nl>"]
 
+[build-dependencies]
+protoc-rust = "2.8.0"
+
 [dependencies]
 crc = "1.8.1"
 log = "^0.3.1"
@@ -17,6 +20,7 @@ fs2 = "0.4.3"
 ctrlc = { version = "3.0", features = [ "termination" ] }
 regex = "1"
 lazy_static = "1.0.1"
-error-chain = "0.12.0"
+error-chain = "0.12.2"
 isatty = "0.1.9"
 num = "0.2.0"
+protobuf = "2.14.0"

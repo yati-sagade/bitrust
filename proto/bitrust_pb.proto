@@ -1,0 +1,29 @@
+syntax = "proto2";
+
+// Data record stored in data files.
+message BitRustDataRecord {
+  // Logical timestamp which serves as the age of this record.
+  optional uint64 timestamp = 1;
+  // Record key.
+  optional bytes key = 2;
+  // Record value.
+  optional bytes value = 3;
+}
+
+// Each hint file record is essentially a serialized keydir entry.
+// If hintfiles are available, they can be used to build the keydir upon startup
+// much faster, as then there is no need to scan through the actual data file,
+// which will tend to be larger.
+message HintFileRecord {
+  // Timestamp of the original record in the data file.
+  optional uint64 timestamp = 1;
+  // Key of the record.
+  optional bytes key = 2;
+  // Offset of the record in the data file (i.e., reading a BitRustDataRecord
+  // at this offset in the data file will give you the full record).
+  optional uint32 record_offset = 3;
+  // Size of the record in the data file.
+  // TODO(yati): Check if this is actually needed, and get rid from KeyDir
+  // and here if not.
+  optional uint32 record_size = 4;
+}
