@@ -209,7 +209,7 @@ pub trait RecordAppender {
 }
 
 #[cfg(test)]
-mod test_utils {
+pub mod test_utils {
   use super::*;
   use bitrust_pb::BitRustDataRecord;
   use std::io::Cursor;

@@ -629,7 +629,7 @@ fn build_keydir(dd_contents: &util::DataDirContents) -> Result<(u64, KeyDir)> {
       }
       util::DataDirEntry::DataFile(data_file_path) => {
         debug!("Reading data file id {}", file_id);
-        let mut data_file = BufReader::new(File::open(&data_file_path)?);
+        let mut data_file = InactiveFile::new(data_file_path.clone())?;
         max_timestamp =
           read_data_file_into_keydir(file_id, &mut data_file, &mut keydir)
             .chain_err(|| {
@@ -698,14 +698,11 @@ where
   Ok(Some(hint_record.get_timestamp()))
 }
 
-fn read_data_file_into_keydir<R>(
+fn read_data_file_into_keydir(
   file_id: FileID,
-  mut data_file: &mut R,
+  mut data_file: &mut InactiveFile,
   keydir: &mut KeyDir,
-) -> io::Result<u64>
-where
-  R: BufRead,
-{
+) -> Result<u64> {
   let mut offset = 0;
   let mut max_timestamp = 0u64;
   while let Some((timestamp, new_offset)) =
@@ -719,33 +716,20 @@ where
 
 // Returns the timestamp of the record just read, and the offset at which the
 // next read can begin.
-fn read_data_file_record_into_keydir<R>(
+fn read_data_file_record_into_keydir(
   file_id: FileID,
-  mut data_file: R,
+  data_file: &mut InactiveFile,
   keydir: &mut KeyDir,
   offset: u64,
-) -> io::Result<Option<(u64, u64)>>
-where
-  R: BufRead,
-{
-  if data_file.fill_buf()?.is_empty() {
-    return Ok(None);
-  }
-  let rec: bitrust_pb::BitRustDataRecord =
-    protobuf::parse_from_reader(&mut data_file)?;
-  keydir.insert(
-    rec.get_key().to_vec(),
-    KeyDirEntry::new(
-      file_id,
-      rec.compute_size() as u16,
-      offset,
-      rec.get_timestamp(),
-    ),
-  );
-  Ok(Some((
-    rec.get_timestamp(),
-    offset + rec.compute_size() as u64,
-  )))
+) -> Result<Option<(u64, u64)>> {
+  Ok(data_file.next_record()?.map(|rec| {
+    let entry_sz = storage::payload_size_for_record(&rec);
+    keydir.insert(
+      rec.get_key().to_vec(),
+      KeyDirEntry::new(file_id, entry_sz as u16, offset, rec.get_timestamp()),
+    );
+    (rec.get_timestamp(), entry_sz)
+  }))
 }
 
 pub struct BitRust<ClockT> {
@@ -943,7 +927,7 @@ mod tests {
   use std::ffi::OsStr;
   use std::io::Cursor;
   use test::Bencher;
-  use util::LogicalClock;
+  use util::{LogicalClock, SerialLogicalClock};
 
   #[allow(dead_code)]
   fn setup_logging() -> Result<()> {
@@ -1080,7 +1064,9 @@ mod tests {
 
   #[test]
   fn test_read_datafile_into_keydir() {
-    let mut cursor = Cursor::new(Vec::new());
+    let t = tempfile::tempdir().unwrap();
+    let mut f =
+      ActiveFile::new(t.as_ref().join("0")).expect("Create ActiveFile");
     let mut data_records = Vec::new();
     let mut offsets_and_sizes = Vec::new();
     for _ in 0..1 {
@@ -1088,13 +1074,15 @@ mod tests {
       data_record.set_timestamp(42);
       data_record.set_key(b"foo".to_vec());
       data_record.set_value(b"bar".to_vec());
-      offsets_and_sizes.push((cursor.position(), data_record.compute_size()));
-      data_record.write_to_writer(&mut cursor).unwrap();
+      let (offset, size) =
+        f.append_record(&data_record).expect("Append record");
+      offsets_and_sizes.push((offset, size));
       data_records.push(data_record);
     }
-    cursor.set_position(0);
+    let mut f: InactiveFile = f.into();
     let mut keydir = KeyDir::new();
-    read_data_file_into_keydir(0, &mut cursor, &mut keydir).unwrap();
+    read_data_file_into_keydir(0, &mut f, &mut keydir)
+      .expect("Read datafile into keydir");
     debug!("keydir loaded as {:?}", &keydir.entries);
     assert!(keydir.entries.len() == data_records.len());
     for ((offset, size), data_record) in
@@ -1108,6 +1096,31 @@ mod tests {
       assert!(keydir_entry.record_offset == offset);
       assert!(keydir_entry.timestamp == data_record.get_timestamp());
     }
+  }
+
+  #[test]
+  fn test_bitrust_read_existing_datadir() {
+    let sz_limit = 1_000;
+    let data_dir = tempfile::tempdir().unwrap();
+    {
+      let cfg = ConfigBuilder::new(&data_dir)
+        .max_file_fize_bytes(sz_limit)
+        .build();
+      let mut br = BitRust::open(cfg, SerialLogicalClock::new(0)).unwrap();
+      br.put(b"foo".to_vec(), b"bar".to_vec())
+        .expect("put to bitrust");
+    }
+    let cfg = ConfigBuilder::new(&data_dir)
+      .max_file_fize_bytes(sz_limit)
+      .build();
+    let mut br = BitRust::open(cfg, SerialLogicalClock::new(0)).unwrap();
+    let read_val = br.get(b"foo").expect("Get key foo from bitrust");
+    assert!(
+      Some(b"bar".to_vec()) == read_val,
+      "Expected Some({:?}), got {:?}",
+      b"bar",
+      &read_val
+    );
   }
 
   #[test]
