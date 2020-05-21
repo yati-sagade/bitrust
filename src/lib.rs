@@ -395,8 +395,6 @@ where
       merge_one_file(
         &mut self.keydir,
         data_file,
-        self.mutex.clone(),
-        &mut self.clock,
         &all_merge_file_ids,
         &mut merge_output_file,
       )?;
@@ -679,7 +677,6 @@ fn read_hint_file_record<R>(
 where
   R: BufRead,
 {
-  // XXX: Somehow using BufReader here does not work, investigate.
   if hint_file.fill_buf()?.is_empty() {
     // EOF
     return Ok(None);
@@ -801,40 +798,34 @@ fn active_file_path<P: AsRef<Path>>(data_dir: P) -> Result<PathBuf> {
     })
 }
 
-fn merge_one_file<ClockT: util::LogicalClock>(
+fn merge_one_file(
   keydir: &mut KeyDir,
   mut data_file: InactiveFile,
-  mutex: Arc<Mutex<()>>,
-  clock: &mut Arc<ClockT>,
   all_merge_file_ids: &HashSet<FileID>,
   merge_output_file: &mut ActiveFile,
 ) -> Result<()> {
-  debug!("Merging file {:?}", &data_file.name);
-
+  debug!(
+    "Merging file {:?}, all mergefiles: {:?}",
+    &data_file.name, all_merge_file_ids
+  );
   'record_loop: while let Some(record) = data_file.next_record()? {
     // Name of the file that the keydir points to for this key.
-    if let Some((current_timestamp, current_file_id)) = keydir
-      .get(record.get_key())
-      .map(|entry| (entry.timestamp, entry.file_id))
+    if let Some(curr_ts) =
+      keydir.get(record.get_key()).map(|entry| entry.timestamp)
     {
-      if (!all_merge_file_ids.contains(&current_file_id)
-        && current_file_id > data_file.id)
-        || current_timestamp > record.get_timestamp()
-      {
-        // We have a newer record in the keydir
+      if curr_ts > record.get_timestamp() {
+        // We have a newer record in the keydir.
         debug!(
-          "  Merge miss, current ts={}, our ts={}, current fid={}, our fid={}",
-          current_timestamp,
+          "  Merge miss, current ts={}, our ts={}",
+          curr_ts,
           record.get_timestamp(),
-          current_file_id,
-          data_file.id,
         );
         continue 'record_loop;
       }
       debug!(
         "  Merge hit, current ts={}, our ts={}",
-        current_timestamp,
-        record.get_timestamp()
+        curr_ts,
+        record.get_timestamp(),
       );
       let record_key = record.get_key().to_vec();
       // We found the key in the keydir, and (at least for the time being)
@@ -844,6 +835,12 @@ fn merge_one_file<ClockT: util::LogicalClock>(
       let (record_offset, record_size) = merge_output_file
         .append_record(&record)
         .chain_err(|| "Failed to write merge record")?;
+      let new_keydir_entry = KeyDirEntry::new(
+        merge_output_file.id,
+        record_size as u16,
+        record_offset,
+        record.get_timestamp(),
+      );
       // BUT between now and us writing the record, a fresh write for the
       // key might have come in. Before we update the keydir to point
       // to the new merge output file for this key, we must check for
@@ -857,20 +854,7 @@ fn merge_one_file<ClockT: util::LogicalClock>(
       //  If we failed to update the keydir in the above sequence, we
       //  should erase the record we just wrote, and then continue with
       //  the merge.
-      let timestamp_now = {
-        let _lock = mutex.lock().unwrap();
-        Arc::get_mut(clock)
-          .expect("Failed to get logical timestamp generator")
-          .tick()
-      };
-
-      let new_keydir_entry = KeyDirEntry::new(
-        merge_output_file.id,
-        record_size as u16,
-        record_offset,
-        timestamp_now,
-      );
-
+      //
       // Update only if either:
       // 1. The file we are currently merging (data_file) is the same id as the
       // keydir entry for this key.
@@ -884,7 +868,6 @@ fn merge_one_file<ClockT: util::LogicalClock>(
             || all_merge_file_ids.contains(&old_keydir_entry.file_id)
         },
       );
-
       if !write_successful {
         // unwrite the record we just wrote.
         debug!(
@@ -988,6 +971,90 @@ mod tests {
       .expect("Read record after retreat and write")
       .expect("Some record");
     assert!(read_rec == rec, "Expected {:?}, got {:?}", rec, read_rec);
+  }
+
+  fn dump_datafile(path: PathBuf) -> Result<()> {
+    debug!("Dumping file {:?}", &path);
+    let mut f = InactiveFile::new(path.clone())?;
+    while let Some(rec) = f.next_record()? {
+      debug!("{:?}", &rec);
+    }
+    Ok(())
+  }
+
+  fn dump_all_datafiles<T>(state: &BitRustState<T>) -> Result<()> {
+    debug!("Inactive files:");
+    let mut file_ids = state.inactive_files.keys().collect::<Vec<_>>();
+    file_ids.sort();
+    for id in file_ids {
+      dump_datafile(
+        state
+          .inactive_files
+          .get(&id)
+          .expect("InactiveFile entry")
+          .name
+          .clone(),
+      )?;
+    }
+    debug!("Active file:");
+    dump_datafile(state.active_file.name.clone())
+  }
+
+  #[test]
+  fn test_merge_after_merge() {
+    if let Err(_) = setup_logging() {}
+    // This tests the scenario where a file with a lower id contains later
+    // writes, and asserts that these are not lost.
+    // 1. Write file 0 just to overflow, it is now inactive, new active file is
+    //    id 1.
+    // 2. Write file 1 just to overflow, it is now inactive, new active file is
+    //    id 2.
+    // 3. Merge 0 and 1 into id 3.
+    // 4. Write file id 2 to overflow, it is now inactive, new active file is id
+    //    4.
+    // 5. Call merge and assert.
+    let sz_limit = 50;
+    let data_dir = tempfile::tempdir().unwrap();
+    let cfg = ConfigBuilder::new(&data_dir)
+      .max_file_fize_bytes(sz_limit)
+      .build();
+    let mut br = BitRust::open(cfg, SerialLogicalClock::new(0)).unwrap();
+    let mut i = 0;
+    while br.state.active_file.id != 2 {
+      br.put(b"foo".to_vec(), format!("foo_{:02}", i).into_bytes())
+        .expect(&format!("Put foo => foo_{:02}", i));
+      i += 1;
+    }
+    debug!("Before first merge:");
+    dump_all_datafiles(&br.state).expect("Dump datafiles");
+    br.merge().expect("First merge");
+    debug!("After first merge");
+    dump_all_datafiles(&br.state).expect("Dump datafiles");
+    assert!(
+      br.state.active_file.id == 2,
+      "Expected active file id to be 2, but found {}",
+      br.state.active_file.id
+    );
+    let mut last_val = String::from("");
+    while br.state.active_file.id == 2 {
+      last_val = format!("foo_{:02}", i);
+      br.put(b"foo".to_vec(), last_val.clone().into_bytes())
+        .expect(&format!("Put foo => foo_{:02}", i));
+      i += 1;
+    }
+    debug!("New active file id: {}", br.state.active_file.id);
+    debug!("After filling, before second merge:");
+    dump_all_datafiles(&br.state).expect("Dump datafiles");
+    br.merge().expect("Second merge");
+    debug!("After second merge:");
+    dump_all_datafiles(&br.state).expect("Dump datafiles");
+    let val = br.get(b"foo").expect("Get foo").expect("Some value");
+    assert!(
+      val == last_val.clone().into_bytes(),
+      "Expected: {}, Got: {}",
+      last_val,
+      std::str::from_utf8(&val).expect("utf-8 string")
+    );
   }
 
   #[test]
