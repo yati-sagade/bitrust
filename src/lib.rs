@@ -395,7 +395,11 @@ where
       merge_one_file(
         &mut self.keydir,
         data_file,
-        &all_merge_file_ids,
+        &mut all_merge_file_ids,
+        &mut self.inactive_files,
+        self.mutex.clone(),
+        &mut self.data_file_id_gen,
+        &self.config,
         &mut merge_output_file,
       )?;
       let data_file_path = data_file_name_from_id(data_file_id, &datadir);
@@ -408,7 +412,6 @@ where
       })?;
       self.inactive_files.remove(&data_file_id);
     }
-
     Ok(())
   }
 
@@ -559,8 +562,7 @@ fn update_active_file_id(id: FileID, config: &Config) -> Result<PathBuf> {
   Ok(new_active_file_path)
 }
 
-// This fn is not thread safe, and assumes only one caller gets to call it at
-// a time.
+// This fn is not thread safe.
 fn maybe_seal_active_file(
   active_file: &mut ActiveFile,
   config: &Config,
@@ -571,31 +573,40 @@ fn maybe_seal_active_file(
   // be active.
   if should_seal_active_data(active_file, config)? {
     debug!("Active file is too big, sealing");
-    let old_active_file = {
-      // XXX: ensure there are no conflicts
-      let new_active_file_id = file_id_gen.take_next();
-      let new_active_file_path =
-        update_active_file_id(new_active_file_id, config)?;
-      debug!("New active file is {:?}", &new_active_file_path);
-
-      let mut new_active_file = ActiveFile::new(new_active_file_path.clone())
-        .chain_err(|| {
-        format!(
-          "Could not create new active file (old:\
-           {:?}, new: {:?})",
-          &active_file.name, &new_active_file_path
-        )
-      })?;
-
-      std::mem::swap(&mut new_active_file, active_file);
-      new_active_file
-    };
-    debug!("Making file {} inactive", old_active_file.id);
-    Ok(Some(old_active_file.into()))
-  //self.inactive_files.insert(inactive_file.id, inactive_file);
+    //self.inactive_files.insert(inactive_file.id, inactive_file);
+    seal_active_file(active_file, file_id_gen.take_next(), config)
+      .map(|f| Some(f))
   } else {
     Ok(None)
   }
+}
+
+// Closes the given active file, and swaps it with a new active file with
+// the given id. Returns the old active file an InactiveFile.
+// Not threadsafe.
+fn seal_active_file(
+  f: &mut ActiveFile,
+  new_active_file_id: FileID,
+  config: &Config,
+) -> Result<InactiveFile> {
+  let old_active_file = {
+    // XXX: ensure there are no conflicts
+    let new_active_file_path =
+      update_active_file_id(new_active_file_id, config)?;
+    debug!("New active file is {:?}", &new_active_file_path);
+    let mut new_active_file = ActiveFile::new(new_active_file_path.clone())
+      .chain_err(|| {
+        format!(
+          "Could not create new active file (old:\
+          {:?}, new: {:?})",
+          &f.name, &new_active_file_path
+        )
+      })?;
+    std::mem::swap(&mut new_active_file, f);
+    new_active_file
+  };
+  debug!("Making file {} inactive", old_active_file.id);
+  Ok(old_active_file.into())
 }
 
 // Returns the largest timestamp encountered, and the the fleshened keydir.
@@ -801,7 +812,11 @@ fn active_file_path<P: AsRef<Path>>(data_dir: P) -> Result<PathBuf> {
 fn merge_one_file(
   keydir: &mut KeyDir,
   mut data_file: InactiveFile,
-  all_merge_file_ids: &HashSet<FileID>,
+  all_merge_file_ids: &mut HashSet<FileID>,
+  inactive_files: &mut HashMap<FileID, InactiveFile>,
+  mutex: Arc<Mutex<()>>,
+  file_id_gen: &mut util::FileIDGen,
+  config: &Config,
   merge_output_file: &mut ActiveFile,
 ) -> Result<()> {
   debug!(
@@ -809,6 +824,18 @@ fn merge_one_file(
     &data_file.name, all_merge_file_ids
   );
   'record_loop: while let Some(record) = data_file.next_record()? {
+    if should_seal_active_data(merge_output_file, config)? {
+      let _lock = mutex.lock().expect("Lock to try sealing mergefile");
+      seal_active_file(merge_output_file, file_id_gen.take_next(), config)
+        .map(|f| inactive_files.insert(f.id, f))?;
+      all_merge_file_ids.insert(merge_output_file.id);
+      // Also need to add the new active file as an inactive file to
+      // the keydir so reads can be served.
+      let merge_inactive_file =
+        InactiveFile::new(merge_output_file.name.clone())
+          .chain_err(|| "Creating an InactiveFile for the new merge file")?;
+      inactive_files.insert(merge_inactive_file.id, merge_inactive_file);
+    }
     // Name of the file that the keydir points to for this key.
     if let Some(curr_ts) =
       keydir.get(record.get_key()).map(|entry| entry.timestamp)
@@ -998,6 +1025,40 @@ mod tests {
     }
     debug!("Active file:");
     dump_datafile(state.active_file.name.clone())
+  }
+
+  #[test]
+  fn test_merge_file_rotation() {
+    if let Err(_) = setup_logging() {}
+    let sz_limit = 50;
+    let data_dir = tempfile::tempdir().unwrap();
+    let cfg = ConfigBuilder::new(&data_dir)
+      .max_file_fize_bytes(sz_limit)
+      .build();
+    let mut br = BitRust::open(cfg, SerialLogicalClock::new(0)).unwrap();
+    let mut i = 0;
+    while br.state.active_file.id != 2 {
+      br.put(
+        format!("foo_{:02}", i).into_bytes(),
+        format!("foo_{:02}", i).into_bytes(),
+      )
+      .expect(&format!("Put foo => foo_{:02}", i));
+      i += 1;
+    }
+    br.merge().expect("Merge");
+    assert!(
+      br.state.inactive_files.len() == 2,
+      "Expected 2 merge files after merge, but {} were found",
+      br.state.inactive_files.len()
+    );
+    assert!(
+      br.state.inactive_files.contains_key(&3),
+      "Expected merge file with id 3"
+    );
+    assert!(
+      br.state.inactive_files.contains_key(&4),
+      "Expected merge file with id 4"
+    );
   }
 
   #[test]

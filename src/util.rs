@@ -65,6 +65,7 @@ pub struct Serial<T> {
   next: T,
 }
 
+// Not threadsafe
 impl<T> Serial<T>
 where
   T: std::ops::AddAssign + num::One + Clone,
