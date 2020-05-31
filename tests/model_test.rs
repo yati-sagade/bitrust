@@ -86,3 +86,68 @@ fn test_model_based_load_store_with_restarts() {
     debug!("Generation {} complete", i);
   }
 }
+
+#[test]
+fn test_model_based_load_store_with_restarts_and_merges() {
+  let data_dir = tempfile::tempdir().unwrap();
+  let keys = (0..1000)
+    .map(|k| format!("key_{}", k))
+    .collect::<Vec<String>>();
+  for i in 0..5 {
+    debug!("Start generation {}", i);
+    {
+      debug!("Generation {}: Opening bitrust", i);
+      let mut br = BitRust::open(
+        ConfigBuilder::new(&data_dir)
+          .max_file_fize_bytes(1000)
+          .build(),
+        SerialLogicalClock::new(0),
+      )
+      .expect("Bitrust open for putting");
+      debug!("Generation {}: Putting keys", i);
+      for key in &keys {
+        let val = format!("{}_{}", key, i);
+        debug!("put {:?} => {:?}", key, &val);
+        br.put(key.as_bytes().to_vec(), val.as_bytes().to_vec())
+          .expect(&format!("Put {:?} => {:?} in generation {}", key, val, i,));
+      }
+    }
+    {
+      debug!("Generation {}: Opening bitrust for merging", i);
+      let mut br = BitRust::open(
+        ConfigBuilder::new(&data_dir)
+          .max_file_fize_bytes(1000)
+          .build(),
+        SerialLogicalClock::new(0),
+      )
+      .expect("Bitrust open for merge");
+      br.merge().expect("Merge");
+    }
+    debug!("Generation {}: Opening bitrust for reading", i);
+    let mut br = BitRust::open(
+      ConfigBuilder::new(&data_dir)
+        .max_file_fize_bytes(1000)
+        .build(),
+      SerialLogicalClock::new(0),
+    )
+    .expect("Bitrust open for reading");
+    debug!(">>>>>");
+    dump_all_datafiles(&br.state).expect("Dump state");
+    debug!("<<<<<");
+    debug!("Merging now");
+    for (key_idx, key) in keys.iter().enumerate() {
+      let expected = Some(format!("{}_{}", key, i));
+      let got = br.get(key.as_bytes()).expect(&format!(
+        "get {} (index {}) for generation {}",
+        key, key_idx, i
+      ));
+      assert!(
+        got == expected.as_ref().map(|v| v.as_bytes().to_vec()),
+        "Expected {:?}, got {:?}",
+        expected,
+        got.map(|v| String::from_utf8(v.clone()).expect("valid string"))
+      );
+    }
+    debug!("Generation {} complete", i);
+  }
+}

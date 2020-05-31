@@ -78,7 +78,6 @@ impl<T: Message> FileBasedRecordReader<T> {
       path: path,
       phantom: PhantomData,
     };
-    debug!("Initialized active file");
     Ok(f)
   }
 }
@@ -838,16 +837,18 @@ fn merge_one_file(
   );
   'record_loop: while let Some(record) = data_file.next_record()? {
     if should_seal_active_data(merge_output_file, config)? {
-      let _lock = mutex.lock().expect("Lock to try sealing mergefile");
-      seal_active_file(merge_output_file, file_id_gen.take_next(), config)
-        .map(|f| inactive_files.insert(f.id, f))?;
-      all_merge_file_ids.insert(merge_output_file.id);
-      // Also need to add the new active file as an inactive file to
-      // the keydir so reads can be served.
-      let merge_inactive_file =
-        InactiveFile::new(merge_output_file.path.clone())
-          .chain_err(|| "Creating an InactiveFile for the new merge file")?;
-      inactive_files.insert(merge_inactive_file.id, merge_inactive_file);
+      {
+        let _lock = mutex.lock().expect("Lock to try sealing mergefile");
+        seal_active_file(merge_output_file, file_id_gen.take_next(), config)
+          .map(|f| inactive_files.insert(f.id, f))?;
+        all_merge_file_ids.insert(merge_output_file.id);
+        // Also need to add the new active file as an inactive file to
+        // the keydir so reads can be served.
+        let merge_inactive_file =
+          InactiveFile::new(merge_output_file.path.clone())
+            .chain_err(|| "Creating an InactiveFile for the new merge file")?;
+        inactive_files.insert(merge_inactive_file.id, merge_inactive_file);
+      }
     }
     // Name of the file that the keydir points to for this key.
     if let Some(curr_ts) =
