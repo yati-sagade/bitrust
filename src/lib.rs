@@ -29,6 +29,7 @@ pub mod util;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::atomic;
 use std::sync::{Arc, Mutex};
@@ -41,7 +42,7 @@ pub use config::*;
 pub use errors::*;
 
 use keydir::{KeyDir, KeyDirEntry};
-use storage::{RecordAppender, RecordReader};
+use storage::{RecordAppend, RecordRead};
 
 macro_rules! debug_timeit {
   ( $name:expr => $b:block ) => {{
@@ -60,87 +61,98 @@ macro_rules! debug_timeit {
 // writing, which happens only by appending, and one handle for reading, which
 // we can seek freely.
 #[derive(Debug)]
-struct ActiveFile {
-  write_handle: File,
-  read_handle: BufReader<File>,
-  pub name: PathBuf,
+struct FileBasedRecordReader<T> {
+  reader: BufReader<File>,
+  pub path: PathBuf,
   pub id: FileID,
+  phantom: PhantomData<T>,
 }
 
-impl ActiveFile {
-  fn new(path: PathBuf) -> io::Result<ActiveFile> {
-    let mut write_handle = OpenOptions::new()
-      .read(true)
-      .write(true)
-      .create(true)
-      .open(&path)?;
-    write_handle.seek(SeekFrom::End(0))?;
-    let active_file = ActiveFile {
-      write_handle: write_handle,
-      read_handle: BufReader::new(
+impl<T: Message> FileBasedRecordReader<T> {
+  fn new(path: PathBuf) -> io::Result<FileBasedRecordReader<T>> {
+    let f = FileBasedRecordReader::<T> {
+      reader: BufReader::new(
         OpenOptions::new().read(true).create(false).open(&path)?,
       ),
       id: util::file_id_from_path(&path),
-      name: path,
+      path: path,
+      phantom: PhantomData,
     };
     debug!("Initialized active file");
-    Ok(active_file)
-  }
-}
-
-impl RecordReader for ActiveFile {
-  type Message = bitrust_pb::BitRustDataRecord;
-  type Reader = BufReader<File>;
-  fn reader<'a>(&'a mut self) -> Result<&'a mut BufReader<File>> {
-    Ok(&mut self.read_handle)
-  }
-}
-
-impl RecordAppender for ActiveFile {
-  type Message = bitrust_pb::BitRustDataRecord;
-  type Writer = File;
-  fn writer<'a>(&'a mut self) -> Result<&'a mut File> {
-    Ok(&mut self.write_handle)
+    Ok(f)
   }
 }
 
 #[derive(Debug)]
-struct InactiveFile {
-  read_handle: BufReader<File>,
-  pub name: PathBuf,
+struct FileBasedRecordRW<T> {
+  writer: File,
+  reader: BufReader<File>,
+  pub path: PathBuf,
   pub id: FileID,
+  phantom: std::marker::PhantomData<T>,
 }
 
-impl InactiveFile {
-  fn new(path: PathBuf) -> io::Result<InactiveFile> {
-    let id = util::file_id_from_path(&path);
-    Ok(InactiveFile {
-      read_handle: BufReader::new(
+impl<T: Message> FileBasedRecordRW<T> {
+  fn new(path: PathBuf) -> io::Result<FileBasedRecordRW<T>> {
+    let mut writer = OpenOptions::new()
+      .read(true)
+      .write(true)
+      .create(true)
+      .open(&path)?;
+    writer.seek(SeekFrom::End(0))?;
+    let f = FileBasedRecordRW::<T> {
+      writer,
+      reader: BufReader::new(
         OpenOptions::new().read(true).create(false).open(&path)?,
       ),
-      name: path,
-      id: id,
-    })
+      id: util::file_id_from_path(&path),
+      path: path,
+      phantom: PhantomData,
+    };
+    debug!("Initialized active file");
+    Ok(f)
   }
 }
 
-impl RecordReader for InactiveFile {
-  type Message = bitrust_pb::BitRustDataRecord;
-  type Reader = BufReader<File>;
-  fn reader<'a>(&'a mut self) -> Result<&'a mut BufReader<File>> {
-    Ok(&mut self.read_handle)
-  }
-}
-
-impl Into<InactiveFile> for ActiveFile {
-  fn into(self) -> InactiveFile {
-    InactiveFile {
-      read_handle: self.read_handle,
-      name: self.name,
+impl<T> Into<FileBasedRecordReader<T>> for FileBasedRecordRW<T> {
+  fn into(self) -> FileBasedRecordReader<T> {
+    FileBasedRecordReader {
+      reader: self.reader,
+      path: self.path,
       id: self.id,
+      phantom: self.phantom,
     }
   }
 }
+
+impl<T: Message> RecordRead for FileBasedRecordReader<T> {
+  type Message = T;
+  type Reader = BufReader<File>;
+  fn reader<'a>(&'a mut self) -> Result<&'a mut BufReader<File>> {
+    Ok(&mut self.reader)
+  }
+}
+
+impl<T: Message> RecordRead for FileBasedRecordRW<T> {
+  type Message = T;
+  type Reader = BufReader<File>;
+  fn reader<'a>(&'a mut self) -> Result<&'a mut BufReader<File>> {
+    Ok(&mut self.reader)
+  }
+}
+
+impl<T: Message> RecordAppend for FileBasedRecordRW<T> {
+  type Message = T;
+  type Writer = File;
+  fn writer<'a>(&'a mut self) -> Result<&'a mut File> {
+    Ok(&mut self.writer)
+  }
+}
+
+type ActiveFile = FileBasedRecordRW<bitrust_pb::BitRustDataRecord>;
+type InactiveFile = FileBasedRecordReader<bitrust_pb::BitRustDataRecord>;
+type HintFileWriter = FileBasedRecordRW<bitrust_pb::HintFileRecord>;
+type HintFileReader = FileBasedRecordReader<bitrust_pb::HintFileRecord>;
 
 #[derive(Debug)]
 pub struct BitRustState<ClockT> {
@@ -484,7 +496,7 @@ where
             .chain_err(|| {
               format!(
                 "Failed to read record from active file ({:?})",
-                &self.active_file.name
+                &self.active_file.path
               )
             })?
         } else {
@@ -506,7 +518,7 @@ where
               format!(
                 "Failed to read record from inactive\
                  file ({:?})",
-                &file.name
+                &file.path
               )
             })?
         };
@@ -532,8 +544,8 @@ where
   }
 }
 
-fn should_seal_active_data(
-  active_file: &mut ActiveFile,
+fn should_seal_active_data<T: Message>(
+  active_file: &mut FileBasedRecordRW<T>,
   config: &Config,
 ) -> Result<bool> {
   active_file
@@ -563,11 +575,11 @@ fn update_active_file_id(id: FileID, config: &Config) -> Result<PathBuf> {
 }
 
 // This fn is not thread safe.
-fn maybe_seal_active_file(
-  active_file: &mut ActiveFile,
+fn maybe_seal_active_file<T: Message>(
+  active_file: &mut FileBasedRecordRW<T>,
   config: &Config,
   file_id_gen: &mut util::FileIDGen,
-) -> Result<Option<InactiveFile>> {
+) -> Result<Option<FileBasedRecordReader<T>>> {
   // Ultimately we want to close the current active file and start
   // writing to a new one. The pointers into the old file should still
   // be active.
@@ -584,24 +596,26 @@ fn maybe_seal_active_file(
 // Closes the given active file, and swaps it with a new active file with
 // the given id. Returns the old active file an InactiveFile.
 // Not threadsafe.
-fn seal_active_file(
-  f: &mut ActiveFile,
+fn seal_active_file<T: Message>(
+  f: &mut FileBasedRecordRW<T>,
   new_active_file_id: FileID,
   config: &Config,
-) -> Result<InactiveFile> {
+) -> Result<FileBasedRecordReader<T>> {
   let old_active_file = {
     // XXX: ensure there are no conflicts
     let new_active_file_path =
       update_active_file_id(new_active_file_id, config)?;
     debug!("New active file is {:?}", &new_active_file_path);
-    let mut new_active_file = ActiveFile::new(new_active_file_path.clone())
-      .chain_err(|| {
-        format!(
-          "Could not create new active file (old:\
+    let mut new_active_file = FileBasedRecordRW::<T>::new(
+      new_active_file_path.clone(),
+    )
+    .chain_err(|| {
+      format!(
+        "Could not create new active file (old:\
           {:?}, new: {:?})",
-          &f.name, &new_active_file_path
-        )
-      })?;
+        &f.path, &new_active_file_path
+      )
+    })?;
     std::mem::swap(&mut new_active_file, f);
     new_active_file
   };
@@ -821,7 +835,7 @@ fn merge_one_file(
 ) -> Result<()> {
   debug!(
     "Merging file {:?}, all mergefiles: {:?}",
-    &data_file.name, all_merge_file_ids
+    &data_file.path, all_merge_file_ids
   );
   'record_loop: while let Some(record) = data_file.next_record()? {
     if should_seal_active_data(merge_output_file, config)? {
@@ -832,7 +846,7 @@ fn merge_one_file(
       // Also need to add the new active file as an inactive file to
       // the keydir so reads can be served.
       let merge_inactive_file =
-        InactiveFile::new(merge_output_file.name.clone())
+        InactiveFile::new(merge_output_file.path.clone())
           .chain_err(|| "Creating an InactiveFile for the new merge file")?;
       inactive_files.insert(merge_inactive_file.id, merge_inactive_file);
     }
@@ -1019,12 +1033,12 @@ mod tests {
           .inactive_files
           .get(&id)
           .expect("InactiveFile entry")
-          .name
+          .path
           .clone(),
       )?;
     }
     debug!("Active file:");
-    dump_datafile(state.active_file.name.clone())
+    dump_datafile(state.active_file.path.clone())
   }
 
   #[test]
@@ -1307,7 +1321,7 @@ mod tests {
     let persisted_active_file_name =
       PathBuf::from(util::read_from_file(active_file_pointer_path).unwrap());
 
-    assert!(persisted_active_file_name == br.state.active_file.name);
+    assert!(persisted_active_file_name == br.state.active_file.path);
 
     assert!(
       data_files.len() == expected_num_data_files,
@@ -1331,7 +1345,7 @@ mod tests {
 
     let br = BitRust::open(cfg, MockClock::new()).unwrap();
 
-    assert!(br.state.active_file.name == data_dir.as_ref().join("0.data"));
+    assert!(br.state.active_file.path == data_dir.as_ref().join("0.data"));
     assert!(br.state.keydir.entries.len() == 0);
     assert!(br.state.inactive_files.len() == 0);
   }

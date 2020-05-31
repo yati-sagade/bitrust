@@ -32,7 +32,7 @@ where
 ///   record_data: [u8; record_size]
 ///   record_data_crc: u32
 ///
-pub trait RecordReader {
+pub trait RecordRead {
   type Reader: BufRead + Seek;
   type Message: protobuf::Message;
 
@@ -158,7 +158,7 @@ pub trait RecordReader {
 // CRCs).
 pub type AppendRecordResult = Result<(u64, u64)>;
 
-pub trait RecordAppender {
+pub trait RecordAppend {
   type Writer: Write + Seek;
   type Message: protobuf::Message;
 
@@ -218,7 +218,7 @@ pub mod test_utils {
     pub cursor: Cursor<T>,
   }
 
-  impl<T: AsRef<[u8]>> RecordReader for CursorBasedReader<T> {
+  impl<T: AsRef<[u8]>> RecordRead for CursorBasedReader<T> {
     type Message = BitRustDataRecord;
     type Reader = Cursor<T>;
 
@@ -231,7 +231,7 @@ pub mod test_utils {
     pub cursor: Cursor<Vec<u8>>,
   }
 
-  impl RecordAppender for CursorBasedWriter {
+  impl RecordAppend for CursorBasedWriter {
     type Message = BitRustDataRecord;
     type Writer = Cursor<Vec<u8>>;
 
