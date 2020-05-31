@@ -750,13 +750,13 @@ fn read_data_file_record_into_keydir(
       rec.get_key().to_vec(),
       KeyDirEntry::new(file_id, entry_sz as u16, offset, rec.get_timestamp()),
     );
-    (rec.get_timestamp(), entry_sz)
+    (rec.get_timestamp(), offset + entry_sz)
   }))
 }
 
 pub struct BitRust<ClockT> {
-  state: BitRustState<ClockT>,
-  running: Arc<atomic::AtomicBool>,
+  pub state: BitRustState<ClockT>,
+  pub running: Arc<atomic::AtomicBool>,
 }
 
 impl<ClockT> Drop for BitRust<ClockT> {
@@ -772,7 +772,6 @@ where
   pub fn open(config: Config, clock: ClockT) -> Result<BitRust<ClockT>> {
     let state = BitRustState::new(config, clock)?;
     let running = Arc::new(atomic::AtomicBool::new(true));
-
     Ok(BitRust { state, running })
   }
 
@@ -938,6 +937,37 @@ fn merge_one_file(
   Ok(())
 }
 
+pub mod test_utils {
+  use super::*;
+
+  pub fn dump_datafile(path: PathBuf) -> Result<()> {
+    debug!("Dumping file {:?}", &path);
+    let mut f = InactiveFile::new(path.clone())?;
+    while let Some(rec) = f.next_record()? {
+      debug!("{:?}", &rec);
+    }
+    Ok(())
+  }
+
+  pub fn dump_all_datafiles<T>(state: &BitRustState<T>) -> Result<()> {
+    debug!("Inactive files:");
+    let mut file_ids = state.inactive_files.keys().collect::<Vec<_>>();
+    file_ids.sort();
+    for id in file_ids {
+      dump_datafile(
+        state
+          .inactive_files
+          .get(&id)
+          .expect("InactiveFile entry")
+          .path
+          .clone(),
+      )?;
+    }
+    debug!("Active file:");
+    dump_datafile(state.active_file.path.clone())
+  }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -946,6 +976,7 @@ mod tests {
 
   use simplelog::{CombinedLogger, LevelFilter, TermLogger};
 
+  use super::test_utils::*;
   use super::*;
   use protobuf::Message;
   use std::ffi::OsStr;
@@ -1012,33 +1043,6 @@ mod tests {
       .expect("Read record after retreat and write")
       .expect("Some record");
     assert!(read_rec == rec, "Expected {:?}, got {:?}", rec, read_rec);
-  }
-
-  fn dump_datafile(path: PathBuf) -> Result<()> {
-    debug!("Dumping file {:?}", &path);
-    let mut f = InactiveFile::new(path.clone())?;
-    while let Some(rec) = f.next_record()? {
-      debug!("{:?}", &rec);
-    }
-    Ok(())
-  }
-
-  fn dump_all_datafiles<T>(state: &BitRustState<T>) -> Result<()> {
-    debug!("Inactive files:");
-    let mut file_ids = state.inactive_files.keys().collect::<Vec<_>>();
-    file_ids.sort();
-    for id in file_ids {
-      dump_datafile(
-        state
-          .inactive_files
-          .get(&id)
-          .expect("InactiveFile entry")
-          .path
-          .clone(),
-      )?;
-    }
-    debug!("Active file:");
-    dump_datafile(state.active_file.path.clone())
   }
 
   #[test]
