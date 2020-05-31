@@ -6,18 +6,22 @@ pub const MAX_ACTIVE_FILE_SIZE_BYTES: u64 = 0x80000000; // 2GB by default
 pub struct Config {
   /// Maximum size of the active file in bytes.
   max_file_fize_bytes: u64,
-
   /// Main data directory where BitRust datafiles are kept.
   datadir: PathBuf,
+  /// Whether failure writing hintfiles should fail merges. Hintfiles speed up
+  /// initial startup, but beyond that are not necessary for correctness.
+  require_hint_file_write_success: bool,
 }
 
 impl Config {
   pub fn datadir(&self) -> &Path {
     &self.datadir
   }
-
   pub fn max_file_fize_bytes(&self) -> u64 {
     self.max_file_fize_bytes
+  }
+  pub fn require_hint_file_write_success(&self) -> bool {
+    self.require_hint_file_write_success
   }
 }
 
@@ -25,6 +29,7 @@ impl Config {
 pub struct ConfigBuilder {
   datadir: PathBuf,
   max_file_fize_bytes: u64,
+  require_hint_file_write_success: bool,
 }
 
 impl ConfigBuilder {
@@ -32,6 +37,7 @@ impl ConfigBuilder {
     ConfigBuilder {
       datadir: datadir.as_ref().to_path_buf(),
       max_file_fize_bytes: MAX_ACTIVE_FILE_SIZE_BYTES,
+      require_hint_file_write_success: false,
     }
   }
 
@@ -40,6 +46,14 @@ impl ConfigBuilder {
     datadir: P,
   ) -> &'a mut ConfigBuilder {
     self.datadir = datadir.as_ref().to_path_buf();
+    self
+  }
+
+  pub fn require_hint_file_write_success<'a>(
+    &'a mut self,
+    val: bool,
+  ) -> &'a mut ConfigBuilder {
+    self.require_hint_file_write_success = val;
     self
   }
 
@@ -55,6 +69,7 @@ impl ConfigBuilder {
     Config {
       datadir: self.datadir.clone(),
       max_file_fize_bytes: self.max_file_fize_bytes,
+      require_hint_file_write_success: false,
     }
   }
 }
