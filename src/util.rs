@@ -1,4 +1,5 @@
 use crc::crc32;
+use errors::*;
 use rand::{self, Rng};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -130,7 +131,8 @@ pub type DataDirContents = HashMap<FileID, DataDirEntry>;
 // indexes into those files. They deliberately contain very similary information
 // to the in-memory keydir data structure. The goal of a hintfile is to allow
 // fast reconstruction of the keydir when recovering.
-enum FileKind {
+#[derive(Debug, PartialEq)]
+pub enum FileKind {
   DataFile,
   HintFile,
 }
@@ -138,13 +140,28 @@ enum FileKind {
 // We'll just stick to the convention that *.data are datafiles, and *.hint
 // are hintfiles.
 impl FileKind {
-  fn from_path<P: AsRef<Path>>(path: P) -> Option<FileKind> {
-    let ext = path.as_ref().extension()?.to_str()?;
+  pub fn from_path<P: AsRef<Path>>(path: P) -> Result<FileKind> {
+    let ext = path.as_ref().extension().and_then(|e| e.to_str());
     match ext {
-      "data" => Some(FileKind::DataFile),
-      "hint" => Some(FileKind::HintFile),
-      _ => None,
+      Some("data") => Ok(FileKind::DataFile),
+      Some("hint") => Ok(FileKind::HintFile),
+      _ => Err(
+        ErrorKind::InvalidFileKind(format!(
+          "Could not determine FileKind for file {:?}",
+          path.as_ref()
+        ))
+        .into(),
+      ),
     }
+  }
+  pub fn filename_from_id(&self, id: FileID) -> String {
+    match self {
+      &FileKind::DataFile => format!("{}.data", id),
+      &FileKind::HintFile => format!("{}.hint", id),
+    }
+  }
+  pub fn path_from_id<P: AsRef<Path>>(&self, id: FileID, dir: P) -> PathBuf {
+    dir.as_ref().join(self.filename_from_id(id))
   }
 }
 
@@ -159,7 +176,7 @@ where
   let mut hint_files = HashMap::<FileID, PathBuf>::new();
   for entry in fs::read_dir(data_dir)? {
     let file_path = entry.expect("Error reading data directory").path();
-    if let Some(file_kind) = FileKind::from_path(&file_path) {
+    if let Ok(file_kind) = FileKind::from_path(&file_path) {
       let file_id = file_id_from_path(&file_path);
       match file_kind {
         FileKind::DataFile => {
@@ -197,6 +214,38 @@ mod tests {
 
   use super::*;
   use std::fs::File;
+  use std::str::FromStr;
+
+  #[test]
+  fn test_file_kind_construction() {
+    assert!(
+      FileKind::from_path("/my/path/100.data").expect("FileKind")
+        == FileKind::DataFile
+    );
+    assert!(
+      FileKind::from_path("/my/path/100.hint").expect("FileKind")
+        == FileKind::HintFile
+    );
+    assert!(FileKind::from_path("/my/path/100.blah").is_err());
+  }
+
+  #[test]
+  fn test_data_file_kind() {
+    assert!(
+      FileKind::DataFile.path_from_id(42, "/my/path")
+        == PathBuf::from_str("/my/path/42.data").expect("path")
+    );
+    assert!(FileKind::DataFile.filename_from_id(42) == "42.data");
+  }
+
+  #[test]
+  fn test_hint_file_kind() {
+    assert!(
+      FileKind::HintFile.path_from_id(42, "/my/path")
+        == PathBuf::from_str("/my/path/42.hint").expect("path")
+    );
+    assert!(FileKind::HintFile.filename_from_id(42) == "42.hint");
+  }
 
   #[test]
   fn test_file_id_from_path() {

@@ -8,6 +8,10 @@ error_chain! { // comes from crate error_chain
             description("Read was performed where none was possible"),
             display("Invalid read: {}", msg)
         }
+        InvalidFileKind(msg: String) {
+            description("Invalid/unknown file kind"),
+            display("Invalid file kind: {}", msg)
+        }
     }
     foreign_links {
         Io(::std::io::Error) #[cfg(unix)];

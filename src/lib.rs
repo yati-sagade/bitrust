@@ -242,10 +242,10 @@ where
       );
       util::write_to_file(
         &ptr_path,
-        data_dir
-          .join("0.data")
+        util::FileKind::DataFile
+          .path_from_id(0, &data_dir)
           .to_str()
-          .expect("Garbled initial data file name?"),
+          .expect("Garbled initial data file name"),
       )
       .chain_err(|| {
         format!(
@@ -315,7 +315,7 @@ where
       .inactive_files
       .keys()
       .cloned()
-      .map(|id| (id, data_file_name_from_id(id, &datadir)))
+      .map(|id| (id, util::FileKind::DataFile.path_from_id(id, &datadir)))
       .collect();
 
     // Sort the above tuples by file id
@@ -378,7 +378,7 @@ where
         self.data_file_id_gen.take_next()
       };
       let merge_output_file_name =
-        data_file_name_from_id(merge_output_file_id, &datadir);
+        util::FileKind::DataFile.path_from_id(merge_output_file_id, &datadir);
 
       let merge_active_file =
         ActiveFile::new(merge_output_file_name.clone())
@@ -396,6 +396,10 @@ where
 
       merge_active_file
     };
+
+    let mut hint_file_writer = HintFileWriter::new(
+      util::FileKind::HintFile.path_from_id(merge_output_file.id, &datadir),
+    )?;
 
     let mut all_merge_file_ids = HashSet::<FileID>::new();
 
@@ -416,8 +420,10 @@ where
         &mut self.data_file_id_gen,
         &self.config,
         &mut merge_output_file,
+        &mut hint_file_writer,
       )?;
-      let data_file_path = data_file_name_from_id(data_file_id, &datadir);
+      let data_file_path =
+        util::FileKind::DataFile.path_from_id(data_file_id, &datadir);
       debug!("Now removing {:?} after merge", &data_file_path);
       fs::remove_file(&data_file_path).chain_err(|| {
         format!(
@@ -558,13 +564,10 @@ fn is_recordio_overlimit<T: Message>(
     .chain_err(|| "Failed to find size of active file by ftelling it")
 }
 
-fn data_file_name_from_id<P: AsRef<Path>>(id: FileID, datadir: P) -> PathBuf {
-  datadir.as_ref().join(&format!("{}.data", id))
-}
-
 fn update_active_file_id(id: FileID, config: &Config) -> Result<PathBuf> {
   let data_dir = config.datadir();
-  let new_active_file_path = data_file_name_from_id(id, &data_dir);
+  let new_active_file_path =
+    util::FileKind::DataFile.path_from_id(id, &data_dir);
   let ptr_path = active_file_pointer_path(&data_dir);
 
   util::write_to_file(
@@ -605,7 +608,8 @@ fn rotate_output<T: Message>(
   config: &Config,
 ) -> Result<FileBasedRecordReader<T>> {
   let old_rw = {
-    let new_path = data_file_name_from_id(new_id, config.datadir());
+    let new_path = util::FileKind::from_path(&rw.path)?
+      .path_from_id(new_id, config.datadir());
     debug!("Rotating {} -> {}", rw.id, new_id);
     let mut new_rw =
       FileBasedRecordRW::<T>::new(new_path.clone()).chain_err(|| {
@@ -634,20 +638,31 @@ fn build_keydir(dd_contents: &util::DataDirContents) -> Result<(u64, KeyDir)> {
     match dd_contents.get(&file_id).unwrap() {
       // If we have the hint file, we prefer reading it since it is almost
       // a direct on-disk representation of the keydir.
-      util::DataDirEntry::DataAndHintFile(_data_file_path, hint_file_path) => {
+      util::DataDirEntry::DataAndHintFile(data_file_path, hint_file_path) => {
         debug!("Reading hint file for file id {}", file_id);
-        let mut hint_file = BufReader::new(
-          File::open(&hint_file_path)
-            .chain_err(|| "Could not open hint file.")?,
-        );
-        max_timestamp =
-          read_hint_file_into_keydir(file_id, &mut hint_file, &mut keydir)
-            .chain_err(|| {
-              format!(
-                "Failed to read hint file {:?} into keydir",
-                &hint_file_path
-              )
-            })?;
+        let mut hint_file = HintFileReader::new(hint_file_path.clone())?;
+        match read_hint_file_into_keydir(file_id, &mut hint_file, &mut keydir) {
+          Ok(hint_max_ts) => {
+            max_timestamp = std::cmp::max(max_timestamp, hint_max_ts);
+          }
+          Err(e) => {
+            warn!(
+              "Error encountered when reading hint file {:?}: {:?},
+              attempting to read data file instead.",
+              hint_file_path, e
+            );
+            let mut data_file = InactiveFile::new(data_file_path.clone())?;
+            let max_timestamp_in_file =
+              read_data_file_into_keydir(file_id, &mut data_file, &mut keydir)
+                .chain_err(|| {
+                  format!(
+                    "Failed to read data file {:?} into keydir",
+                    &data_file_path
+                  )
+                })?;
+            max_timestamp = std::cmp::max(max_timestamp, max_timestamp_in_file);
+          }
+        }
       }
       util::DataDirEntry::DataFile(data_file_path) => {
         debug!("Reading data file id {}", file_id);
@@ -667,68 +682,49 @@ fn build_keydir(dd_contents: &util::DataDirContents) -> Result<(u64, KeyDir)> {
   Ok((max_timestamp, keydir))
 }
 
-fn read_hint_file_into_keydir<R>(
+fn read_hint_file_into_keydir(
   file_id: FileID,
-  hint_file: &mut R,
+  hint_file: &mut HintFileReader,
   keydir: &mut KeyDir,
-) -> io::Result<u64>
-where
-  R: BufRead,
-{
+) -> Result<u64> {
   let mut max_timestamp = 0u64;
   // We receive a Some(_) when EOF hasn't been reached.
-  while let Some(ts) = read_hint_file_record(file_id, hint_file, keydir)? {
-    max_timestamp = ts;
+  while let Some(ts) =
+    read_hint_file_record_into_keydir(file_id, hint_file, keydir)?
+  {
+    max_timestamp = std::cmp::max(ts, max_timestamp);
   }
   Ok(max_timestamp)
 }
 
-// Return an Err(_) when an io error happens
-//
-// Return an Ok(Some(timestamp)) when we did not hit EOF when trying to read a
-// record (i.e., more might come)
-//
-// Return an Ok(None) when we encountered an EOF when reading the first 8
-// bytes of the record (means end of stream).
-//
-// There is a possibility that we read a part of the 8 bytes that we wanted to
-// read, and that might indicate a subtle corruption. We handle that by reading
-// the first field slightly more laboriously.
-fn read_hint_file_record<R>(
+fn read_hint_file_record_into_keydir(
   file_id: FileID,
-  mut hint_file: &mut R,
+  hint_file: &mut HintFileReader,
   keydir: &mut KeyDir,
-) -> io::Result<Option<u64>>
-where
-  R: BufRead,
-{
-  if hint_file.fill_buf()?.is_empty() {
-    // EOF
-    return Ok(None);
-  }
-  let hint_record =
-    protobuf::parse_from_reader::<bitrust_pb::HintFileRecord>(&mut hint_file)?;
-  keydir.insert(
-    hint_record.get_key().to_vec(),
-    KeyDirEntry::new(
-      file_id,
-      hint_record.get_record_size() as u16,
-      hint_record.get_record_offset().into(),
-      hint_record.get_timestamp(),
-    ),
-  );
-  Ok(Some(hint_record.get_timestamp()))
+) -> Result<Option<u64>> {
+  Ok(hint_file.next_record()?.map(|rec| {
+    keydir.insert_if_newer(
+      rec.get_key().to_vec(),
+      KeyDirEntry::new(
+        file_id,
+        rec.get_record_size() as u16,
+        rec.get_record_offset() as u64,
+        rec.get_timestamp(),
+      ),
+    );
+    rec.get_timestamp()
+  }))
 }
 
 fn read_data_file_into_keydir(
   file_id: FileID,
-  mut data_file: &mut InactiveFile,
+  data_file: &mut InactiveFile,
   keydir: &mut KeyDir,
 ) -> Result<u64> {
   let mut offset = 0;
   let mut max_timestamp = 0u64;
   while let Some((timestamp, new_offset)) =
-    read_data_file_record_into_keydir(file_id, &mut data_file, keydir, offset)?
+    read_data_file_record_into_keydir(file_id, data_file, keydir, offset)?
   {
     max_timestamp = std::cmp::max(timestamp, max_timestamp);
     offset = new_offset;
@@ -822,6 +818,20 @@ fn active_file_path<P: AsRef<Path>>(data_dir: P) -> Result<PathBuf> {
     })
 }
 
+fn write_hint_record(
+  hint_file_writer: &mut HintFileWriter,
+  entry_offset: u64,
+  entry_size: u64,
+  record: &bitrust_pb::BitRustDataRecord,
+) -> Result<()> {
+  let mut hint = bitrust_pb::HintFileRecord::new();
+  hint.set_key(record.get_key().to_vec());
+  hint.set_record_offset(entry_offset as u32);
+  hint.set_record_size(entry_size as u32);
+  hint.set_timestamp(record.get_timestamp());
+  hint_file_writer.append_record(&hint).map(|_| ())
+}
+
 fn merge_one_file(
   keydir: &mut KeyDir,
   mut data_file: InactiveFile,
@@ -831,6 +841,7 @@ fn merge_one_file(
   file_id_gen: &mut util::FileIDGen,
   config: &Config,
   merge_output_file: &mut ActiveFile,
+  hint_file_writer: &mut HintFileWriter,
 ) -> Result<()> {
   debug!(
     "Merging file {:?}, all mergefiles: {:?}",
@@ -840,11 +851,10 @@ fn merge_one_file(
     if is_recordio_overlimit(merge_output_file, config)? {
       {
         let _lock = mutex.lock().expect("Lock to try sealing mergefile");
-        // TODO: This is buggy, as it internally updates the active file pointer
-        // to the merge output file! Write a test and fix.
         rotate_output(merge_output_file, file_id_gen.take_next(), config)
           .map(|f| inactive_files.insert(f.id, f))?;
         all_merge_file_ids.insert(merge_output_file.id);
+        rotate_output(hint_file_writer, merge_output_file.id, config)?;
         // Also need to add the new active file as an inactive file to
         // the keydir so reads can be served.
         let merge_inactive_file =
@@ -912,12 +922,27 @@ fn merge_one_file(
             || all_merge_file_ids.contains(&old_keydir_entry.file_id)
         },
       );
-      if !write_successful {
+      if write_successful {
+        if let Err(e) = write_hint_record(
+          hint_file_writer,
+          record_offset,
+          record_size,
+          &record,
+        ) {
+          if config.require_hint_file_write_success() {
+            return Err(e);
+          }
+          warn!(
+            "Failed to write record to hint file {:?}: {:?}",
+            hint_file_writer.path, e
+          );
+        }
+      } else {
         // unwrite the record we just wrote.
         debug!(
-          "*** Concurrent write to a key being merged detected, unmerging\
-          record {:?}",
-          &record
+          "Concurrent write to key {:?} being merged detected, unmerging\
+          record",
+          record.get_key()
         );
         merge_output_file
           .retreat(record_size as u64)
@@ -1190,34 +1215,38 @@ mod tests {
   #[test]
   fn test_read_hintfile_into_keydir() {
     setup_logging();
-    let mut cursor = Cursor::new(Vec::new());
-    let mut hint_records = Vec::new();
-    for _ in 0..1 {
+    let t = tempfile::tempdir().unwrap();
+    {
       let mut hint_record = bitrust_pb::HintFileRecord::new();
       hint_record.set_timestamp(42);
       hint_record.set_key(b"foo".to_vec());
       hint_record.set_record_offset(9);
       hint_record.set_record_size(103);
-      hint_record.write_to_writer(&mut cursor).unwrap();
-      hint_records.push(hint_record);
+      let mut rw = HintFileWriter::new(t.as_ref().join("0"))
+        .expect("Create HintFileWriter");
+      rw.append_record(&hint_record).expect("Write hint record");
     }
-    debug!("Done preparing test_read_hintfile_into_keydir records");
-    cursor.set_position(0);
     let mut keydir = KeyDir::new();
-    read_hint_file_into_keydir(0, &mut cursor, &mut keydir).unwrap();
-
-    debug!("On to asserting now");
-    for hint_record in hint_records.into_iter() {
-      let keydir_entry = keydir.get(hint_record.get_key());
-      assert!(keydir_entry.is_some(), "Expected to find keydir entry");
-      let keydir_entry = keydir_entry.unwrap();
-      assert!(keydir_entry.file_id == 0);
-      assert!(keydir_entry.record_size == hint_record.get_record_size() as u16);
-      assert!(
-        keydir_entry.record_offset == hint_record.get_record_offset() as u64
-      );
-      assert!(keydir_entry.timestamp == hint_record.get_timestamp());
+    {
+      let mut r = HintFileReader::new(t.as_ref().join("0"))
+        .expect("Create HintFileReader");
+      read_hint_file_into_keydir(99, &mut r, &mut keydir)
+        .expect("read_hint_file_into_keydir");
+      assert!(r.next_record().expect("read record at eof").is_none());
     }
+    assert!(
+      keydir.entries.len() == 1,
+      "Expected one entry, got {}",
+      keydir.entries.len()
+    );
+    let e = keydir.get(b"foo").expect("Entry with key foo");
+    let expected = KeyDirEntry::new(99, 103, 9, 42);
+    assert!(
+      *e == expected,
+      "Expected entry {:?}, found {:?}",
+      expected,
+      e
+    );
   }
 
   #[test]
@@ -1228,16 +1257,13 @@ mod tests {
       ActiveFile::new(t.as_ref().join("0")).expect("Create ActiveFile");
     let mut data_records = Vec::new();
     let mut offsets_and_sizes = Vec::new();
-    for _ in 0..1 {
-      let mut data_record = bitrust_pb::BitRustDataRecord::new();
-      data_record.set_timestamp(42);
-      data_record.set_key(b"foo".to_vec());
-      data_record.set_value(b"bar".to_vec());
-      let (offset, size) =
-        f.append_record(&data_record).expect("Append record");
-      offsets_and_sizes.push((offset, size));
-      data_records.push(data_record);
-    }
+    let mut data_record = bitrust_pb::BitRustDataRecord::new();
+    data_record.set_timestamp(42);
+    data_record.set_key(b"foo".to_vec());
+    data_record.set_value(b"bar".to_vec());
+    let (offset, size) = f.append_record(&data_record).expect("Append record");
+    offsets_and_sizes.push((offset, size));
+    data_records.push(data_record);
     let mut f: InactiveFile = f.into();
     let mut keydir = KeyDir::new();
     read_data_file_into_keydir(0, &mut f, &mut keydir)
