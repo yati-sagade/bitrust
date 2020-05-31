@@ -1061,7 +1061,7 @@ mod tests {
 
   #[test]
   fn test_merge_file_rotation() {
-    if let Err(_) = setup_logging() {}
+    setup_logging();
     let sz_limit = 50;
     let data_dir = tempfile::tempdir().unwrap();
     let cfg = ConfigBuilder::new(&data_dir)
@@ -1095,7 +1095,7 @@ mod tests {
 
   #[test]
   fn test_merge_after_merge() {
-    if let Err(_) = setup_logging() {}
+    setup_logging();
     // This tests the scenario where a file with a lower id contains later
     // writes, and asserts that these are not lost.
     // 1. Write file 0 just to overflow, it is now inactive, new active file is
@@ -1152,6 +1152,7 @@ mod tests {
 
   #[test]
   fn test_merge() {
+    setup_logging();
     let sz_limit = 100;
     let data_dir = tempfile::tempdir().unwrap();
     let cfg = ConfigBuilder::new(&data_dir)
@@ -1192,6 +1193,7 @@ mod tests {
 
   #[test]
   fn test_read_hintfile_into_keydir() {
+    setup_logging();
     let mut cursor = Cursor::new(Vec::new());
     let mut hint_records = Vec::new();
     for _ in 0..1 {
@@ -1224,6 +1226,7 @@ mod tests {
 
   #[test]
   fn test_read_datafile_into_keydir() {
+    setup_logging();
     let t = tempfile::tempdir().unwrap();
     let mut f =
       ActiveFile::new(t.as_ref().join("0")).expect("Create ActiveFile");
@@ -1260,6 +1263,7 @@ mod tests {
 
   #[test]
   fn test_bitrust_read_existing_datadir() {
+    setup_logging();
     let sz_limit = 1_000;
     let data_dir = tempfile::tempdir().unwrap();
     {
@@ -1285,26 +1289,21 @@ mod tests {
 
   #[test]
   fn test_bitrust_state_evolution() {
+    setup_logging();
     let sz_limit = 1_000;
-
     let data_dir = tempfile::tempdir().unwrap();
     let cfg = ConfigBuilder::new(&data_dir)
       .max_file_fize_bytes(sz_limit)
       .build();
-
     let mut br = BitRust::open(cfg, MockClock::new()).unwrap();
-
     let mut clock = MockClock::new();
     clock.set_next(42);
-
     let mut proto_record = bitrust_pb::BitRustDataRecord::new();
     proto_record.set_timestamp(clock.tick());
     proto_record.set_key(b"somekey".to_vec());
     proto_record.set_value(b"somevalue".to_vec());
     let entry_sz = storage::payload_size_for_record(&proto_record);
-
     let num_entries = 1000;
-
     for _ in 0..num_entries {
       br.put(
         proto_record.get_key().to_vec(),
@@ -1312,10 +1311,8 @@ mod tests {
       )
       .unwrap();
     }
-
     let expected_num_data_files =
       (entry_sz as f64 * num_entries as f64 / sz_limit as f64).ceil() as usize;
-
     let data_files = fs::read_dir(&data_dir)
       .unwrap()
       .map(|entry| entry.unwrap())
@@ -1333,14 +1330,10 @@ mod tests {
         }
       })
       .collect::<Vec<_>>();
-
     let active_file_pointer_path = active_file_pointer_path(&data_dir);
-
     let persisted_active_file_name =
       PathBuf::from(util::read_from_file(active_file_pointer_path).unwrap());
-
     assert!(persisted_active_file_name == br.state.active_file.path);
-
     assert!(
       data_files.len() == expected_num_data_files,
       format!(
@@ -1353,16 +1346,14 @@ mod tests {
 
   #[test]
   fn test_bitrust_state_init_from_scratch() {
+    setup_logging();
     // we expect the active file to be sealed once it reaches 1kB
     let sz_limit = 1_000;
-
     let data_dir = tempfile::tempdir().unwrap();
     let cfg = ConfigBuilder::new(data_dir.as_ref())
       .max_file_fize_bytes(sz_limit)
       .build();
-
     let br = BitRust::open(cfg, MockClock::new()).unwrap();
-
     assert!(br.state.active_file.path == data_dir.as_ref().join("0.data"));
     assert!(br.state.keydir.entries.len() == 0);
     assert!(br.state.inactive_files.len() == 0);
@@ -1370,26 +1361,22 @@ mod tests {
 
   #[test]
   fn test_get_files_for_merging() {
+    setup_logging();
     let sz_limit = 1024; // bytes
-
     let data_dir = tempfile::tempdir().unwrap();
     let cfg = ConfigBuilder::new(&data_dir)
       .max_file_fize_bytes(sz_limit)
       .build();
-
     let mut br = BitRust::open(cfg, MockClock::new()).unwrap();
     let mut clock = MockClock::new();
     clock.set_next(42);
-
     let mut proto_record = bitrust_pb::BitRustDataRecord::new();
     proto_record.set_timestamp(clock.tick());
     proto_record.set_key(b"somekey".to_vec());
     proto_record.set_value(b"somevalue".to_vec());
     let entry_sz = storage::payload_size_for_record(&proto_record);
-
     let total_entries = 256;
     let entries_per_file = sz_limit / (entry_sz as u64);
-
     let total_files_needed = (total_entries as f64 * entry_sz as f64
       / sz_limit as f64)
       .ceil() as usize;
@@ -1400,7 +1387,6 @@ mod tests {
     } else {
       total_files_needed - 1
     };
-
     for _ in 0..total_entries {
       br.put(
         proto_record.get_key().to_vec(),
@@ -1408,11 +1394,18 @@ mod tests {
       )
       .unwrap();
     }
-
     let files_to_merge = br.state.get_files_for_merging();
-
-    assert!(files_to_merge.len() == num_merge_files_expected, "Total files created={}, merge files expected={}, merge files actual={}, record size={}, total entries={}, entries_per_file={}", total_files_needed, num_merge_files_expected, files_to_merge.len(), entry_sz, total_entries, entries_per_file);
-
+    assert!(
+      files_to_merge.len() == num_merge_files_expected,
+      "Total files created={}, merge files expected={}, merge files actual={},\
+      record size={}, total entries={}, entries_per_file={}",
+      total_files_needed,
+      num_merge_files_expected,
+      files_to_merge.len(),
+      entry_sz,
+      total_entries,
+      entries_per_file
+    );
     for fid in files_to_merge {
       assert!(
         fid.0 != br.state.active_file.id,
@@ -1424,18 +1417,15 @@ mod tests {
 
   #[test]
   fn test_overflow_puts() {
+    setup_logging();
     // Test that when we overflow into multiple data files, the store still
     // returns expected values.
-
     let sz_limit = 100; // small size limit so we always overflow.
-
     let data_dir = tempfile::tempdir().unwrap();
     let cfg = ConfigBuilder::new(&data_dir)
       .max_file_fize_bytes(sz_limit)
       .build();
-
     let mut br = BitRust::open(cfg, MockClock::new()).unwrap();
-
     let key_vals = (0..1000)
       .map(|_| {
         (
@@ -1444,11 +1434,9 @@ mod tests {
         )
       })
       .collect::<Vec<_>>();
-
     for (key, val) in key_vals.iter().cloned() {
       br.put(key, val).unwrap();
     }
-
     for (key, val) in key_vals.into_iter() {
       assert!(br.get(&key).unwrap() == Some(val));
     }
@@ -1456,11 +1444,10 @@ mod tests {
 
   #[test]
   fn test_creation() {
+    setup_logging();
     let data_dir = tempfile::tempdir().unwrap();
-
     let cfg = ConfigBuilder::new(&data_dir).build();
     let mut br = BitRustState::new(cfg, MockClock::new()).unwrap();
-
     br.put(b"foo".to_vec(), b"bar".to_vec()).unwrap();
     let r = br.get(b"foo").unwrap().unwrap();
     assert!(r == b"bar");
@@ -1468,35 +1455,32 @@ mod tests {
 
   #[test]
   fn test_locking_of_data_dir() {
+    setup_logging();
     let data_dir = tempfile::tempdir().unwrap();
-
     let cfg = ConfigBuilder::new(&data_dir).build();
     let _br = BitRustState::new(cfg.clone(), MockClock::new()).unwrap();
-
     let another_br = BitRustState::new(cfg, MockClock::new());
     assert!(another_br.is_err());
   }
 
   #[test]
   fn test_deletion() {
+    setup_logging();
     let data_dir = tempfile::tempdir().unwrap();
-
     let cfg = ConfigBuilder::new(&data_dir).build();
     let mut br = BitRustState::new(cfg, MockClock::new()).unwrap();
-
     br.put(b"foo".to_vec(), b"bar".to_vec()).unwrap();
     assert!(br.get(b"foo").unwrap().unwrap() == b"bar");
-
     br.delete(b"foo").unwrap();
     assert!(br.get(b"foo").unwrap().is_none());
   }
 
   #[bench]
   fn bench_put(b: &mut Bencher) {
+    setup_logging();
     let data_dir = tempfile::tempdir().unwrap();
     let config = ConfigBuilder::new(&data_dir).build();
     let mut br = BitRust::open(config, MockClock::new()).unwrap();
-
     let key = util::rand_str().as_bytes().to_vec();
     let val = util::rand_str().as_bytes().to_vec();
     b.iter(move || {

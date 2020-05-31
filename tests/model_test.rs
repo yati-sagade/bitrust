@@ -4,24 +4,14 @@ extern crate tempfile;
 #[macro_use]
 extern crate log;
 
-use bitrust::test_utils::dump_all_datafiles;
+use bitrust::test_utils::{dump_all_datafiles, setup_logging};
 use bitrust::util::{rand_str, SerialLogicalClock};
 use bitrust::{BitRust, BitRustState, ConfigBuilder};
-use simplelog::{CombinedLogger, LevelFilter, TermLogger};
 use std::collections::HashMap;
-
-#[allow(dead_code)]
-fn setup_logging() {
-  CombinedLogger::init(vec![TermLogger::new(
-    LevelFilter::Debug,
-    simplelog::Config::default(),
-  )
-  .unwrap()])
-  .expect("Logging setup");
-}
 
 #[test]
 fn test_model_based_load_store() {
+  setup_logging();
   let data_dir = tempfile::tempdir().unwrap();
   let cfg = ConfigBuilder::new(&data_dir).build();
   let mut br = BitRustState::new(cfg, SerialLogicalClock::new(0)).unwrap();
@@ -42,6 +32,7 @@ fn test_model_based_load_store() {
 
 #[test]
 fn test_model_based_load_store_with_restarts() {
+  setup_logging();
   let data_dir = tempfile::tempdir().unwrap();
   let keys = (0..1000)
     .map(|k| format!("key_{}", k))

@@ -133,8 +133,10 @@ where
 #[cfg(test)]
 mod tests {
   use super::*;
+  use test_utils::*;
   #[test]
   fn test_insert_if_newer_inserts_when_nonexistent() {
+    setup_logging();
     let mut k = KeyDir::new();
     let entry = KeyDirEntry::new(0, 42, 0, 1);
     let e = k.insert_if_newer(b"foo".to_vec(), entry.clone());
@@ -143,6 +145,7 @@ mod tests {
 
   #[test]
   fn test_insert_if_newer_does_not_update_for_older_or_equal_timestamps() {
+    setup_logging();
     let mut k = KeyDir::new();
     let entry0 = KeyDirEntry::new(0, 42, 0, 1);
     k.insert(b"foo".to_vec(), entry0.clone());
@@ -156,6 +159,7 @@ mod tests {
 
   #[test]
   fn test_insert_if_newer_updates_for_newer_timestamps() {
+    setup_logging();
     let mut k = KeyDir::new();
     k.insert(b"foo".to_vec(), KeyDirEntry::new(0, 42, 0, 1));
     // Higher timestamp. Must update.
