@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 // below). The KeyDirEntry for a given key tells us which file we need to look
 // into, along with the offset into that file, and the size of the record we
 // must read out.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct KeyDirEntry {
   /// Id of the file where this key lives
   pub file_id: FileID,
@@ -61,6 +61,26 @@ impl KeyDir {
     self.entries.insert(key, entry);
   }
 
+  /// Inserts `entry` into the keydir iff either `key` does not exist in the
+  /// keydir, or if `entry.timestamp` is larger than the existing entry's
+  /// timestamp.
+  pub fn insert_if_newer<'a>(
+    &'a mut self,
+    key: Vec<u8>,
+    entry: KeyDirEntry,
+  ) -> &'a KeyDirEntry {
+    let _write_lock = self.rwlock.write().unwrap();
+    self
+      .entries
+      .entry(key)
+      .and_modify(|e| {
+        if e.timestamp < entry.timestamp {
+          *e = entry.clone();
+        }
+      })
+      .or_insert(entry)
+  }
+
   pub fn get<'a>(&'a self, key: &[u8]) -> Option<&'a KeyDirEntry> {
     let _read_lock = self.rwlock.read().unwrap();
     self.entries.get(key)
@@ -108,4 +128,39 @@ where
       false
     }
   })
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  #[test]
+  fn test_insert_if_newer_inserts_when_nonexistent() {
+    let mut k = KeyDir::new();
+    let entry = KeyDirEntry::new(0, 42, 0, 1);
+    let e = k.insert_if_newer(b"foo".to_vec(), entry.clone());
+    assert!(e == &entry, "Expected {:?}, got {:?}", &entry, e);
+  }
+
+  #[test]
+  fn test_insert_if_newer_does_not_update_for_older_or_equal_timestamps() {
+    let mut k = KeyDir::new();
+    let entry0 = KeyDirEntry::new(0, 42, 0, 1);
+    k.insert(b"foo".to_vec(), entry0.clone());
+    // Same timestamp, but different value. Must not update.
+    let e = k.insert_if_newer(b"foo".to_vec(), KeyDirEntry::new(0, 84, 0, 1));
+    assert!(e == &entry0, "Expected {:?}, got {:?}", &entry0, e);
+    // Lower timestamp. Must not update.
+    let e = k.insert_if_newer(b"foo".to_vec(), KeyDirEntry::new(0, 84, 0, 0));
+    assert!(e == &entry0, "Expected {:?}, got {:?}", &entry0, e);
+  }
+
+  #[test]
+  fn test_insert_if_newer_updates_for_newer_timestamps() {
+    let mut k = KeyDir::new();
+    k.insert(b"foo".to_vec(), KeyDirEntry::new(0, 42, 0, 1));
+    // Higher timestamp. Must update.
+    let entry1 = KeyDirEntry::new(0, 84, 0, 2);
+    let e = k.insert_if_newer(b"foo".to_vec(), entry1.clone());
+    assert!(e == &entry1, "Expected {:?}, got {:?}", &entry1, e);
+  }
 }

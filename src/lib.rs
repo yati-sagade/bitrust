@@ -303,6 +303,10 @@ where
     Ok(bitrust)
   }
 
+  pub fn active_file_id(&self) -> FileID {
+    self.active_file.id
+  }
+
   /// Returns a vector of `(file_id, path_to_file)` tuples, sorted ascending
   /// by `file_id`.
   fn get_files_for_merging(&self) -> Vec<(FileID, PathBuf)> {
@@ -652,7 +656,7 @@ fn build_keydir(dd_contents: &util::DataDirContents) -> Result<(u64, KeyDir)> {
       util::DataDirEntry::DataFile(data_file_path) => {
         debug!("Reading data file id {}", file_id);
         let mut data_file = InactiveFile::new(data_file_path.clone())?;
-        max_timestamp =
+        let max_timestamp_in_file =
           read_data_file_into_keydir(file_id, &mut data_file, &mut keydir)
             .chain_err(|| {
               format!(
@@ -660,6 +664,7 @@ fn build_keydir(dd_contents: &util::DataDirContents) -> Result<(u64, KeyDir)> {
                 &data_file_path
               )
             })?;
+        max_timestamp = std::cmp::max(max_timestamp, max_timestamp_in_file);
       }
     }
   }
@@ -729,7 +734,7 @@ fn read_data_file_into_keydir(
   while let Some((timestamp, new_offset)) =
     read_data_file_record_into_keydir(file_id, &mut data_file, keydir, offset)?
   {
-    max_timestamp = timestamp;
+    max_timestamp = std::cmp::max(timestamp, max_timestamp);
     offset = new_offset;
   }
   Ok(max_timestamp)
@@ -745,7 +750,7 @@ fn read_data_file_record_into_keydir(
 ) -> Result<Option<(u64, u64)>> {
   Ok(data_file.next_record()?.map(|rec| {
     let entry_sz = storage::payload_size_for_record(&rec);
-    keydir.insert(
+    keydir.insert_if_newer(
       rec.get_key().to_vec(),
       KeyDirEntry::new(file_id, entry_sz as u16, offset, rec.get_timestamp()),
     );
@@ -839,6 +844,8 @@ fn merge_one_file(
     if should_seal_active_data(merge_output_file, config)? {
       {
         let _lock = mutex.lock().expect("Lock to try sealing mergefile");
+        // TODO: This is buggy, as it internally updates the active file pointer
+        // to the merge output file! Write a test and fix.
         seal_active_file(merge_output_file, file_id_gen.take_next(), config)
           .map(|f| inactive_files.insert(f.id, f))?;
         all_merge_file_ids.insert(merge_output_file.id);
@@ -940,6 +947,25 @@ fn merge_one_file(
 
 pub mod test_utils {
   use super::*;
+  extern crate simplelog;
+  use simplelog::{CombinedLogger, LevelFilter, TermLogger};
+
+  static ONCE: std::sync::Once = std::sync::Once::new();
+
+  pub fn setup_logging() {
+    ONCE.call_once(|| {
+      if std::env::var("BITRUST_TEST_DEBUG_LOGS").is_ok() {
+        CombinedLogger::init(vec![TermLogger::new(
+          LevelFilter::Debug,
+          simplelog::Config::default(),
+        )
+        .unwrap()])
+        .chain_err(|| "Error setting up logging")
+        .map(|_| ())
+        .expect("Setup logging");
+      }
+    });
+  }
 
   pub fn dump_datafile(path: PathBuf) -> Result<()> {
     debug!("Dumping file {:?}", &path);
@@ -975,8 +1001,6 @@ mod tests {
   extern crate simplelog;
   extern crate tempfile;
 
-  use simplelog::{CombinedLogger, LevelFilter, TermLogger};
-
   use super::test_utils::*;
   use super::*;
   use protobuf::Message;
@@ -984,18 +1008,6 @@ mod tests {
   use std::io::Cursor;
   use test::Bencher;
   use util::{LogicalClock, SerialLogicalClock};
-
-  #[allow(dead_code)]
-  fn setup_logging() -> Result<()> {
-    CombinedLogger::init(vec![TermLogger::new(
-      LevelFilter::Debug,
-      simplelog::Config::default(),
-    )
-    .unwrap()])
-    .chain_err(|| "Error setting up logging")
-    .map(|_| ())
-    .map_err(|e| e.into())
-  }
 
   struct MockClock {
     time: u64,
@@ -1018,6 +1030,7 @@ mod tests {
 
   #[test]
   fn test_active_file_retreat() {
+    setup_logging();
     let data_dir = tempfile::tempdir().unwrap();
     let mut f =
       ActiveFile::new(data_dir.as_ref().join("0")).expect("Active file");
