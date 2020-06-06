@@ -476,10 +476,12 @@ where
     let config = &self.config;
     let file_id_gen = &mut self.data_file_id_gen;
 
-    maybe_seal_active_file(active_file, config, file_id_gen)?.map(
-      |inactive_file| inactive_files.insert(inactive_file.id, inactive_file),
-    );
-
+    if let Some(inactive_file) =
+      maybe_rotate_output(active_file, config, file_id_gen)?
+    {
+      inactive_files.insert(inactive_file.id, inactive_file);
+      update_active_file_id(active_file.id, config)?;
+    }
     Ok(())
   }
 
@@ -547,12 +549,11 @@ where
   }
 }
 
-fn should_seal_active_data<T: Message>(
-  active_file: &mut FileBasedRecordRW<T>,
+fn is_recordio_overlimit<T: Message>(
+  rw: &mut FileBasedRecordRW<T>,
   config: &Config,
 ) -> Result<bool> {
-  active_file
-    .tell()
+  rw.tell()
     .map(|size| size >= config.max_file_fize_bytes())
     .chain_err(|| "Failed to find size of active file by ftelling it")
 }
@@ -578,19 +579,18 @@ fn update_active_file_id(id: FileID, config: &Config) -> Result<PathBuf> {
 }
 
 // This fn is not thread safe.
-fn maybe_seal_active_file<T: Message>(
-  active_file: &mut FileBasedRecordRW<T>,
+fn maybe_rotate_output<T: Message>(
+  rw: &mut FileBasedRecordRW<T>,
   config: &Config,
   file_id_gen: &mut util::FileIDGen,
 ) -> Result<Option<FileBasedRecordReader<T>>> {
   // Ultimately we want to close the current active file and start
   // writing to a new one. The pointers into the old file should still
   // be active.
-  if should_seal_active_data(active_file, config)? {
+  if is_recordio_overlimit(rw, config)? {
     debug!("Active file is too big, sealing");
     //self.inactive_files.insert(inactive_file.id, inactive_file);
-    seal_active_file(active_file, file_id_gen.take_next(), config)
-      .map(|f| Some(f))
+    rotate_output(rw, file_id_gen.take_next(), config).map(|f| Some(f))
   } else {
     Ok(None)
   }
@@ -599,31 +599,27 @@ fn maybe_seal_active_file<T: Message>(
 // Closes the given active file, and swaps it with a new active file with
 // the given id. Returns the old active file an InactiveFile.
 // Not threadsafe.
-fn seal_active_file<T: Message>(
-  f: &mut FileBasedRecordRW<T>,
-  new_active_file_id: FileID,
+fn rotate_output<T: Message>(
+  rw: &mut FileBasedRecordRW<T>,
+  new_id: FileID,
   config: &Config,
 ) -> Result<FileBasedRecordReader<T>> {
-  let old_active_file = {
-    // XXX: ensure there are no conflicts
-    let new_active_file_path =
-      update_active_file_id(new_active_file_id, config)?;
-    debug!("New active file is {:?}", &new_active_file_path);
-    let mut new_active_file = FileBasedRecordRW::<T>::new(
-      new_active_file_path.clone(),
-    )
-    .chain_err(|| {
-      format!(
-        "Could not create new active file (old:\
+  let old_rw = {
+    let new_path = data_file_name_from_id(new_id, config.datadir());
+    debug!("Rotating {} -> {}", rw.id, new_id);
+    let mut new_rw =
+      FileBasedRecordRW::<T>::new(new_path.clone()).chain_err(|| {
+        format!(
+          "Could not create new active file (old:\
           {:?}, new: {:?})",
-        &f.path, &new_active_file_path
-      )
-    })?;
-    std::mem::swap(&mut new_active_file, f);
-    new_active_file
+          &rw.path, &new_path
+        )
+      })?;
+    std::mem::swap(&mut new_rw, rw);
+    new_rw
   };
-  debug!("Making file {} inactive", old_active_file.id);
-  Ok(old_active_file.into())
+  debug!("Making file {} inactive", old_rw.id);
+  Ok(old_rw.into())
 }
 
 // Returns the largest timestamp encountered, and the the fleshened keydir.
@@ -841,12 +837,12 @@ fn merge_one_file(
     &data_file.path, all_merge_file_ids
   );
   'record_loop: while let Some(record) = data_file.next_record()? {
-    if should_seal_active_data(merge_output_file, config)? {
+    if is_recordio_overlimit(merge_output_file, config)? {
       {
         let _lock = mutex.lock().expect("Lock to try sealing mergefile");
         // TODO: This is buggy, as it internally updates the active file pointer
         // to the merge output file! Write a test and fix.
-        seal_active_file(merge_output_file, file_id_gen.take_next(), config)
+        rotate_output(merge_output_file, file_id_gen.take_next(), config)
           .map(|f| inactive_files.insert(f.id, f))?;
         all_merge_file_ids.insert(merge_output_file.id);
         // Also need to add the new active file as an inactive file to

@@ -82,11 +82,13 @@ fn test_model_based_load_store_with_restarts() {
 fn test_model_based_load_store_with_restarts_and_merges() {
   setup_logging();
   let data_dir = tempfile::tempdir().unwrap();
-  let expected_value = {
+  let mut expected_values = HashMap::<String, String>::new();
+  {
     let mut br = BitRust::open(
       ConfigBuilder::new(&data_dir)
-        // Every write rotates the active file since our records are at least 16
-        // bytes each.
+        // We write records of the form foo => foo_[0-9], which makes the entry
+        // size 30 bytes. This option makes the active file rotate after each
+        // put.
         .max_file_fize_bytes(30)
         .build(),
       SerialLogicalClock::new(0),
@@ -96,24 +98,22 @@ fn test_model_based_load_store_with_restarts_and_merges() {
     while br.state.active_file_id() != 2 {
       br.put(b"foo".to_vec(), format!("foo_{}", i).as_bytes().to_vec())
         .expect(&format!("put foo => foo_{}", i));
+      br.put(b"bar".to_vec(), format!("bar_{}", i).as_bytes().to_vec())
+        .expect(&format!("put foo => bar_{}", i));
       i += 1;
     }
     debug!(
       "Total {} records written. Current active file is {}.",
+      i * 2,
       br.state.active_file_id(),
-      i
     );
-    debug!("Before merge");
-    dump_all_datafiles(&br.state).expect("dump state");
-    debug!("Merging now");
     br.merge().expect("merge");
-    dump_all_datafiles(&br.state).expect("dump state");
-    debug!("Writing another record foo => _");
     br.put(b"foo".to_vec(), b"_".to_vec())
       .expect("put foo => _");
     dump_all_datafiles(&br.state).expect("dump state");
-    "_"
-  };
+    expected_values.insert("foo".to_string(), "_".to_string());
+    expected_values.insert("bar".to_string(), format!("bar_{}", i - 1));
+  }
   debug!("Reopening for reading");
   let mut br = BitRust::open(
     ConfigBuilder::new(&data_dir)
@@ -122,13 +122,29 @@ fn test_model_based_load_store_with_restarts_and_merges() {
     SerialLogicalClock::new(0),
   )
   .expect("Bitrust open for putting");
-  let read_value = br.get(b"foo").expect("Get foo");
-  let read_value_str =
-    String::from_utf8(read_value.expect("Some value")).expect("Valid string");
+  debug!(
+    "Opened bitrust with active file {}",
+    br.state.active_file_id()
+  );
+  for (key, val) in &expected_values {
+    let v = String::from_utf8(
+      br.get(key.as_bytes())
+        .expect(&format!("Get {} with non-error value", key))
+        .expect(&format!("Get {} with some value", key)),
+    )
+    .expect("Valid utf8 string");
+    assert!(
+      v == *val,
+      "Expected {} => {}, found {} => {}",
+      key,
+      val,
+      key,
+      v
+    );
+  }
   assert!(
-    read_value_str == expected_value,
-    "Expected {}, read {}",
-    expected_value,
-    read_value_str
+    br.state.active_file_id() == 2,
+    "Expected file id 2 to be the active file, but active file id is {}",
+    br.state.active_file_id()
   );
 }
