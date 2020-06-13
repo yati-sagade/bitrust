@@ -88,6 +88,7 @@ struct FileBasedRecordRW<T> {
   reader: BufReader<File>,
   pub path: PathBuf,
   pub id: FileID,
+  pub w_offset: u64,
   phantom: std::marker::PhantomData<T>,
 }
 
@@ -98,7 +99,7 @@ impl<T: Message> FileBasedRecordRW<T> {
       .write(true)
       .create(true)
       .open(&path)?;
-    writer.seek(SeekFrom::End(0))?;
+    let w_offset = writer.seek(SeekFrom::End(0))?;
     let f = FileBasedRecordRW::<T> {
       writer,
       reader: BufReader::new(
@@ -107,9 +108,21 @@ impl<T: Message> FileBasedRecordRW<T> {
       id: util::file_id_from_path(&path),
       path: path,
       phantom: PhantomData,
+      w_offset: w_offset,
     };
     debug!("Initialized active file");
     Ok(f)
+  }
+
+  fn append_record(&mut self, record: &T) -> storage::AppendRecordResult {
+    let (offset, payload_len) = RecordAppend::append_record(self, record)?;
+    self.w_offset += payload_len;
+    Ok((offset, payload_len))
+  }
+
+  fn retreat(&mut self, bytes_to_retreat: u64) -> Result<u64> {
+    self.w_offset = RecordAppend::retreat(self, bytes_to_retreat)?;
+    Ok(self.w_offset)
   }
 }
 
@@ -145,6 +158,10 @@ impl<T: Message> RecordAppend for FileBasedRecordRW<T> {
   type Writer = File;
   fn writer<'a>(&'a mut self) -> Result<&'a mut File> {
     Ok(&mut self.writer)
+  }
+
+  fn tell(&mut self) -> Result<u64> {
+    Ok(self.w_offset)
   }
 }
 
