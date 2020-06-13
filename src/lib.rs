@@ -18,8 +18,8 @@ extern crate error_chain;
 
 mod bitrust_pb;
 mod common;
-mod config;
-mod errors;
+pub mod config;
+pub mod errors;
 mod keydir;
 mod lockfile;
 mod locking;
@@ -1451,8 +1451,8 @@ mod tests {
     let key_vals = (0..1000)
       .map(|_| {
         (
-          util::rand_str().as_bytes().to_vec(),
-          util::rand_str().as_bytes().to_vec(),
+          util::rand_str_with_rand_size().as_bytes().to_vec(),
+          util::rand_str_with_rand_size().as_bytes().to_vec(),
         )
       })
       .collect::<Vec<_>>();
@@ -1503,8 +1503,8 @@ mod tests {
     let data_dir = tempfile::tempdir().unwrap();
     let config = ConfigBuilder::new(&data_dir).build();
     let mut br = BitRust::open(config, MockClock::new()).unwrap();
-    let key = util::rand_str().as_bytes().to_vec();
-    let val = util::rand_str().as_bytes().to_vec();
+    let key = util::rand_str_with_rand_size().as_bytes().to_vec();
+    let val = util::rand_str_with_rand_size().as_bytes().to_vec();
     b.iter(move || {
       br.put(key.clone(), val.clone()).unwrap();
     });

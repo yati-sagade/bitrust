@@ -37,9 +37,16 @@ where
   Ok(buf)
 }
 
-pub fn rand_str() -> String {
-  let size: usize = rand::thread_rng().gen_range(4, 1024);
-  rand::thread_rng().gen_iter::<char>().take(size).collect()
+pub fn rand_str(len: usize) -> String {
+  rand::thread_rng().gen_iter::<char>().take(len).collect()
+}
+
+pub fn rand_str_with_rand_size() -> String {
+  rand_str(rand::thread_rng().gen_range(4, 1024))
+}
+
+pub fn rand_bytes(len: usize) -> Vec<u8> {
+  rand::thread_rng().gen_iter::<u8>().take(len).collect()
 }
 
 pub fn file_id_from_path<P>(path: P) -> u16
