@@ -1,75 +1,78 @@
-use std::path::{Path, PathBuf};
+use serde::Deserialize;
 
-pub const MAX_ACTIVE_FILE_SIZE_BYTES: u64 = 0x80000000; // 2GB by default
+use std::path::PathBuf;
+use std::time::Duration;
 
-#[derive(Debug, Clone)]
-pub struct Config {
-  /// Maximum size of the active file in bytes.
-  max_file_fize_bytes: u64,
-  /// Main data directory where BitRust datafiles are kept.
-  datadir: PathBuf,
+pub const DEFAULT_FILE_SIZE_SOFT_LIMIT_BYTES: i64 = 10 << 20; // 10MiB
+
+fn default_file_size_soft_limit_bytes() -> i64 {
+  DEFAULT_FILE_SIZE_SOFT_LIMIT_BYTES
+}
+
+fn default_require_hint_file_write_success() -> bool {
+  false
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct AutoMergeConfig {
+  /// How often to check if a merge can be performed.
+  pub check_interval: Duration,
+  /// Minimum number of inactive datafiles for a merge to be triggered.
+  pub min_inactive_files: i32,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub enum MergeKind {
+  Manual,
+  Auto(AutoMergeConfig),
+}
+
+impl Default for MergeKind {
+  fn default() -> MergeKind {
+    MergeKind::Manual
+  }
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct MergeConfig {
   /// Whether failure writing hintfiles should fail merges. Hintfiles speed up
   /// initial startup, but beyond that are not necessary for correctness.
-  require_hint_file_write_success: bool,
+  #[serde(default = "default_require_hint_file_write_success")]
+  pub require_hint_file_write_success: bool,
+  #[serde(default)]
+  pub merge_kind_config: MergeKind,
 }
 
-impl Config {
-  pub fn datadir(&self) -> &Path {
-    &self.datadir
-  }
-  pub fn max_file_fize_bytes(&self) -> u64 {
-    self.max_file_fize_bytes
-  }
-  pub fn require_hint_file_write_success(&self) -> bool {
-    self.require_hint_file_write_success
-  }
-}
-
-#[derive(Debug)]
-pub struct ConfigBuilder {
-  datadir: PathBuf,
-  max_file_fize_bytes: u64,
-  require_hint_file_write_success: bool,
-}
-
-impl ConfigBuilder {
-  pub fn new<P: AsRef<Path>>(datadir: P) -> ConfigBuilder {
-    ConfigBuilder {
-      datadir: datadir.as_ref().to_path_buf(),
-      max_file_fize_bytes: MAX_ACTIVE_FILE_SIZE_BYTES,
+impl Default for MergeConfig {
+  fn default() -> MergeConfig {
+    MergeConfig {
       require_hint_file_write_success: false,
+      merge_kind_config: MergeKind::default(),
     }
   }
+}
 
-  pub fn datadir<'a, P: AsRef<Path>>(
-    &'a mut self,
-    datadir: P,
-  ) -> &'a mut ConfigBuilder {
-    self.datadir = datadir.as_ref().to_path_buf();
-    self
-  }
+#[derive(Deserialize, Debug, Clone)]
+pub struct Config {
+  /// Main data directory where BitRust datafiles are kept.
+  pub datadir: PathBuf,
+  #[serde(default = "default_file_size_soft_limit_bytes")]
+  pub file_size_soft_limit_bytes: i64,
+  #[serde(default)]
+  pub merge_config: MergeConfig,
+}
 
-  pub fn require_hint_file_write_success<'a>(
-    &'a mut self,
-    val: bool,
-  ) -> &'a mut ConfigBuilder {
-    self.require_hint_file_write_success = val;
-    self
-  }
-
-  pub fn max_file_fize_bytes<'a>(
-    &'a mut self,
-    size: u64,
-  ) -> &'a mut ConfigBuilder {
-    self.max_file_fize_bytes = size;
-    self
-  }
-
-  pub fn build(&mut self) -> Config {
-    Config {
-      datadir: self.datadir.clone(),
-      max_file_fize_bytes: self.max_file_fize_bytes,
-      require_hint_file_write_success: false,
-    }
+#[cfg(test)]
+mod tests {
+  use super::*;
+  #[test]
+  fn test_read_minimal_config() {
+    let cfg: Config = toml::from_str(
+      r#"
+    datadir = "/home/ysagade/bitrust_data"
+    "#,
+    )
+    .unwrap();
+    println!("Parsed: {:?}", cfg);
   }
 }

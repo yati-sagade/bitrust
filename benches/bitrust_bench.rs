@@ -6,15 +6,20 @@ extern crate tempfile;
 #[macro_use]
 extern crate log;
 
-use criterion::{black_box, criterion_group, BatchSize, Criterion, Throughput};
-use std::collections::HashSet;
+use bitrust::config::{
+  Config, MergeConfig, DEFAULT_FILE_SIZE_SOFT_LIMIT_BYTES,
+};
+use bitrust::BitRust;
+use criterion::{criterion_group, BatchSize, Criterion, Throughput};
 
 pub fn put_throughput_benchmark(c: &mut Criterion) {
   let data_dir = tempfile::tempdir().unwrap();
-  let mut br = bitrust::BitRust::open(
-    bitrust::config::ConfigBuilder::new(&data_dir)
-      .max_file_fize_bytes(10_000_000_000)
-      .build(),
+  let mut br = BitRust::open(
+    Config {
+      datadir: data_dir.as_ref().to_path_buf(),
+      file_size_soft_limit_bytes: DEFAULT_FILE_SIZE_SOFT_LIMIT_BYTES,
+      merge_config: MergeConfig::default(),
+    },
     bitrust::util::SerialLogicalClock::new(0),
   )
   .expect("Opening bitrust");
@@ -55,10 +60,12 @@ pub fn fillrandom(c: &mut Criterion) {
     b.iter_batched(
       || {
         let data_dir = tempfile::tempdir().unwrap();
-        let br = bitrust::BitRust::open(
-          bitrust::config::ConfigBuilder::new(&data_dir)
-            .max_file_fize_bytes(10_000_000)
-            .build(),
+        let br = BitRust::open(
+          Config {
+            datadir: data_dir.as_ref().to_path_buf(),
+            file_size_soft_limit_bytes: DEFAULT_FILE_SIZE_SOFT_LIMIT_BYTES,
+            merge_config: MergeConfig::default(),
+          },
           bitrust::util::SerialLogicalClock::new(0),
         )
         .expect("Opening bitrust");
@@ -77,10 +84,12 @@ pub fn fillrandom(c: &mut Criterion) {
 
 pub fn overwrite(c: &mut Criterion) {
   let data_dir = tempfile::tempdir().unwrap();
-  let mut br = bitrust::BitRust::open(
-    bitrust::config::ConfigBuilder::new(&data_dir)
-      .max_file_fize_bytes(10_000_000)
-      .build(),
+  let mut br = BitRust::open(
+    Config {
+      datadir: data_dir.as_ref().to_path_buf(),
+      file_size_soft_limit_bytes: DEFAULT_FILE_SIZE_SOFT_LIMIT_BYTES,
+      merge_config: MergeConfig::default(),
+    },
     bitrust::util::SerialLogicalClock::new(0),
   )
   .expect("Opening bitrust");
@@ -113,10 +122,12 @@ pub fn overwrite(c: &mut Criterion) {
 pub fn getrandom_no_merge(c: &mut Criterion) {
   bitrust::test_utils::setup_logging();
   let data_dir = tempfile::tempdir().unwrap();
-  let mut br = bitrust::BitRust::open(
-    bitrust::config::ConfigBuilder::new(&data_dir)
-      .max_file_fize_bytes(10_000_000)
-      .build(),
+  let mut br = BitRust::open(
+    Config {
+      datadir: data_dir.as_ref().to_path_buf(),
+      file_size_soft_limit_bytes: DEFAULT_FILE_SIZE_SOFT_LIMIT_BYTES,
+      merge_config: MergeConfig::default(),
+    },
     bitrust::util::SerialLogicalClock::new(0),
   )
   .expect("Opening bitrust");
@@ -147,10 +158,12 @@ pub fn getrandom_no_merge(c: &mut Criterion) {
 
 pub fn putrandom_no_merge(c: &mut Criterion) {
   let data_dir = tempfile::tempdir().unwrap();
-  let mut br = bitrust::BitRust::open(
-    bitrust::config::ConfigBuilder::new(&data_dir)
-      .max_file_fize_bytes(10_000_000)
-      .build(),
+  let mut br = BitRust::open(
+    Config {
+      datadir: data_dir.as_ref().to_path_buf(),
+      file_size_soft_limit_bytes: DEFAULT_FILE_SIZE_SOFT_LIMIT_BYTES,
+      merge_config: MergeConfig::default(),
+    },
     bitrust::util::SerialLogicalClock::new(0),
   )
   .expect("Opening bitrust");

@@ -6,7 +6,9 @@ extern crate crc;
 extern crate num;
 extern crate protobuf;
 extern crate rand;
+extern crate serde;
 extern crate test;
+extern crate toml;
 
 #[macro_use]
 extern crate log;
@@ -28,7 +30,7 @@ pub mod util;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
+use std::io::{self, BufReader, Seek, SeekFrom};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::atomic;
@@ -209,15 +211,13 @@ where
     mut clock: ClockT,
   ) -> Result<BitRustState<ClockT>> {
     info!("Making a bitrust");
-    fs::create_dir_all(config.datadir()).chain_err(|| {
+    fs::create_dir_all(&config.datadir).chain_err(|| {
       format!(
         "Failed to ensure that datadir is created at {:?}\
          (permission issues?)",
-        &config.datadir()
+        &config.datadir
       )
     })?;
-
-    let data_dir = config.datadir().to_path_buf();
 
     // If the following fails, all it means is that we have a file at our
     // lockfile location that we did not create. We don't care at this
@@ -227,10 +227,10 @@ where
     // returned object goes out of scope. Since we move it into the
     // returned BitRustState, this means the lock lives as long as the returned
     // BitRustState lives.
-    let lockfile = locking::acquire(&data_dir, BitrustOperation::Write)
+    let lockfile = locking::acquire(&config.datadir, BitrustOperation::Write)
       .chain_err(|| {
-        format!("Failed to obtain write lock in {:?}", &data_dir)
-      })?;
+      format!("Failed to obtain write lock in {:?}", &config.datadir)
+    })?;
 
     debug!("Obtained data directory lock");
 
@@ -241,18 +241,18 @@ where
     // file (because hint files just contain pointers into the respective
     // data files)
     let dd_contents =
-      util::read_data_dir_contents(&data_dir).chain_err(|| {
+      util::read_data_dir_contents(&config.datadir).chain_err(|| {
         format!(
           "Failed to enumerate contents of the data dir\
            {:?} when starting up bitrust",
-          &data_dir
+          &config.datadir
         )
       })?;
 
     let (latest_timestamp, keydir) = if dd_contents.len() == 0 {
       // We are starting from scratch, write the name of the active file
       // as 0.data.
-      let ptr_path = active_file_pointer_path(&data_dir);
+      let ptr_path = active_file_pointer_path(&config.datadir);
       debug!(
         "Starting in an empty data directory, writing {:?}",
         &ptr_path
@@ -260,7 +260,7 @@ where
       util::write_to_file(
         &ptr_path,
         util::FileKind::DataFile
-          .path_from_id(0, &data_dir)
+          .path_from_id(0, &config.datadir)
           .to_str()
           .expect("Garbled initial data file name"),
       )
@@ -282,7 +282,7 @@ where
     };
     debug!("Done building keydir: {:?}", &keydir.entries);
 
-    let active_file_name = active_file_path(&data_dir)?;
+    let active_file_name = active_file_path(&config.datadir)?;
     debug!("Using active file {:?}", &active_file_name);
     let active_file =
       ActiveFile::new(active_file_name.clone()).chain_err(|| {
@@ -327,12 +327,16 @@ where
   /// Returns a vector of `(file_id, path_to_file)` tuples, sorted ascending
   /// by `file_id`.
   fn get_files_for_merging(&self) -> Vec<(FileID, PathBuf)> {
-    let datadir = self.config.datadir();
     let mut files_to_merge: Vec<(FileID, PathBuf)> = self
       .inactive_files
       .keys()
       .cloned()
-      .map(|id| (id, util::FileKind::DataFile.path_from_id(id, &datadir)))
+      .map(|id| {
+        (
+          id,
+          util::FileKind::DataFile.path_from_id(id, &self.config.datadir),
+        )
+      })
       .collect();
 
     // Sort the above tuples by file id
@@ -353,12 +357,9 @@ where
     // Try to get a merge-lock on the active directory.
     // Go through the files in ascending order of ids
     let _merge_lockfile =
-      locking::acquire(&self.config.datadir(), BitrustOperation::Merge)
+      locking::acquire(&self.config.datadir, BitrustOperation::Merge)
         .chain_err(|| {
-          format!(
-            "Failed to acquire merge lock in {:?}",
-            &self.config.datadir()
-          )
+          format!("Failed to acquire merge lock in {:?}", &self.config.datadir)
         })?;
 
     debug!("Acquired merge lockfile");
@@ -386,7 +387,7 @@ where
       merge_files
     };
 
-    let datadir = self.config.datadir();
+    let datadir = &self.config.datadir;
 
     let mut merge_output_file = {
       let mutex = self.mutex.clone();
@@ -395,7 +396,7 @@ where
         self.data_file_id_gen.take_next()
       };
       let merge_output_file_name =
-        util::FileKind::DataFile.path_from_id(merge_output_file_id, &datadir);
+        util::FileKind::DataFile.path_from_id(merge_output_file_id, datadir);
 
       let merge_active_file =
         ActiveFile::new(merge_output_file_name.clone())
@@ -415,7 +416,7 @@ where
     };
 
     let mut hint_file_writer = HintFileWriter::new(
-      util::FileKind::HintFile.path_from_id(merge_output_file.id, &datadir),
+      util::FileKind::HintFile.path_from_id(merge_output_file.id, datadir),
     )?;
 
     let mut all_merge_file_ids = HashSet::<FileID>::new();
@@ -440,7 +441,7 @@ where
         &mut hint_file_writer,
       )?;
       let data_file_path =
-        util::FileKind::DataFile.path_from_id(data_file_id, &datadir);
+        util::FileKind::DataFile.path_from_id(data_file_id, datadir);
       debug!("Now removing {:?} after merge", &data_file_path);
       fs::remove_file(&data_file_path).chain_err(|| {
         format!(
@@ -577,15 +578,14 @@ fn is_recordio_overlimit<T: Message>(
   config: &Config,
 ) -> Result<bool> {
   rw.tell()
-    .map(|size| size >= config.max_file_fize_bytes())
+    .map(|size| size >= config.file_size_soft_limit_bytes as u64)
     .chain_err(|| "Failed to find size of active file by ftelling it")
 }
 
 fn update_active_file_id(id: FileID, config: &Config) -> Result<PathBuf> {
-  let data_dir = config.datadir();
   let new_active_file_path =
-    util::FileKind::DataFile.path_from_id(id, &data_dir);
-  let ptr_path = active_file_pointer_path(&data_dir);
+    util::FileKind::DataFile.path_from_id(id, &config.datadir);
+  let ptr_path = active_file_pointer_path(&config.datadir);
 
   util::write_to_file(
     &ptr_path,
@@ -626,7 +626,7 @@ fn rotate_output<T: Message>(
 ) -> Result<FileBasedRecordReader<T>> {
   let old_rw = {
     let new_path = util::FileKind::from_path(&rw.path)?
-      .path_from_id(new_id, config.datadir());
+      .path_from_id(new_id, &config.datadir);
     debug!("Rotating {} -> {}", rw.id, new_id);
     let mut new_rw =
       FileBasedRecordRW::<T>::new(new_path.clone()).chain_err(|| {
@@ -946,7 +946,7 @@ fn merge_one_file(
           record_size,
           &record,
         ) {
-          if config.require_hint_file_write_success() {
+          if config.merge_config.require_hint_file_write_success {
             return Err(e);
           }
           warn!(
@@ -1041,9 +1041,7 @@ mod tests {
 
   use super::test_utils::*;
   use super::*;
-  use protobuf::Message;
   use std::ffi::OsStr;
-  use std::io::Cursor;
   use test::Bencher;
   use util::{LogicalClock, SerialLogicalClock};
 
@@ -1102,9 +1100,11 @@ mod tests {
     setup_logging();
     let sz_limit = 50;
     let data_dir = tempfile::tempdir().unwrap();
-    let cfg = ConfigBuilder::new(&data_dir)
-      .max_file_fize_bytes(sz_limit)
-      .build();
+    let cfg = Config {
+      datadir: data_dir.as_ref().to_path_buf(),
+      file_size_soft_limit_bytes: sz_limit,
+      merge_config: MergeConfig::default(),
+    };
     let mut br = BitRust::open(cfg, SerialLogicalClock::new(0)).unwrap();
     let mut i = 0;
     while br.state.active_file.id != 2 {
@@ -1146,9 +1146,11 @@ mod tests {
     // 5. Call merge and assert.
     let sz_limit = 50;
     let data_dir = tempfile::tempdir().unwrap();
-    let cfg = ConfigBuilder::new(&data_dir)
-      .max_file_fize_bytes(sz_limit)
-      .build();
+    let cfg = Config {
+      datadir: data_dir.as_ref().to_path_buf(),
+      file_size_soft_limit_bytes: sz_limit,
+      merge_config: MergeConfig::default(),
+    };
     let mut br = BitRust::open(cfg, SerialLogicalClock::new(0)).unwrap();
     let mut i = 0;
     while br.state.active_file.id != 2 {
@@ -1193,9 +1195,11 @@ mod tests {
     setup_logging();
     let sz_limit = 100;
     let data_dir = tempfile::tempdir().unwrap();
-    let cfg = ConfigBuilder::new(&data_dir)
-      .max_file_fize_bytes(sz_limit)
-      .build();
+    let cfg = Config {
+      datadir: data_dir.as_ref().to_path_buf(),
+      file_size_soft_limit_bytes: sz_limit,
+      merge_config: MergeConfig::default(),
+    };
     let mut br = BitRust::open(cfg, MockClock::new()).unwrap();
     let keys = vec!["foo".to_string(), "bar".to_string(), "baz".to_string()];
     let num_writes = 4;
@@ -1306,16 +1310,20 @@ mod tests {
     let sz_limit = 1_000;
     let data_dir = tempfile::tempdir().unwrap();
     {
-      let cfg = ConfigBuilder::new(&data_dir)
-        .max_file_fize_bytes(sz_limit)
-        .build();
+      let cfg = Config {
+        datadir: data_dir.as_ref().to_path_buf(),
+        file_size_soft_limit_bytes: sz_limit,
+        merge_config: MergeConfig::default(),
+      };
       let mut br = BitRust::open(cfg, SerialLogicalClock::new(0)).unwrap();
       br.put(b"foo".to_vec(), b"bar".to_vec())
         .expect("put to bitrust");
     }
-    let cfg = ConfigBuilder::new(&data_dir)
-      .max_file_fize_bytes(sz_limit)
-      .build();
+    let cfg = Config {
+      datadir: data_dir.as_ref().to_path_buf(),
+      file_size_soft_limit_bytes: sz_limit,
+      merge_config: MergeConfig::default(),
+    };
     let mut br = BitRust::open(cfg, SerialLogicalClock::new(0)).unwrap();
     let read_val = br.get(b"foo").expect("Get key foo from bitrust");
     assert!(
@@ -1331,9 +1339,11 @@ mod tests {
     setup_logging();
     let sz_limit = 1_000;
     let data_dir = tempfile::tempdir().unwrap();
-    let cfg = ConfigBuilder::new(&data_dir)
-      .max_file_fize_bytes(sz_limit)
-      .build();
+    let cfg = Config {
+      datadir: data_dir.as_ref().to_path_buf(),
+      file_size_soft_limit_bytes: sz_limit,
+      merge_config: MergeConfig::default(),
+    };
     let mut br = BitRust::open(cfg, MockClock::new()).unwrap();
     let mut clock = MockClock::new();
     clock.set_next(42);
@@ -1389,9 +1399,11 @@ mod tests {
     // we expect the active file to be sealed once it reaches 1kB
     let sz_limit = 1_000;
     let data_dir = tempfile::tempdir().unwrap();
-    let cfg = ConfigBuilder::new(data_dir.as_ref())
-      .max_file_fize_bytes(sz_limit)
-      .build();
+    let cfg = Config {
+      datadir: data_dir.as_ref().to_path_buf(),
+      file_size_soft_limit_bytes: sz_limit,
+      merge_config: MergeConfig::default(),
+    };
     let br = BitRust::open(cfg, MockClock::new()).unwrap();
     assert!(br.state.active_file.path == data_dir.as_ref().join("0.data"));
     assert!(br.state.keydir.entries.len() == 0);
@@ -1403,9 +1415,11 @@ mod tests {
     setup_logging();
     let sz_limit = 1024; // bytes
     let data_dir = tempfile::tempdir().unwrap();
-    let cfg = ConfigBuilder::new(&data_dir)
-      .max_file_fize_bytes(sz_limit)
-      .build();
+    let cfg = Config {
+      datadir: data_dir.as_ref().to_path_buf(),
+      file_size_soft_limit_bytes: sz_limit,
+      merge_config: MergeConfig::default(),
+    };
     let mut br = BitRust::open(cfg, MockClock::new()).unwrap();
     let mut clock = MockClock::new();
     clock.set_next(42);
@@ -1415,7 +1429,7 @@ mod tests {
     proto_record.set_value(b"somevalue".to_vec());
     let entry_sz = storage::payload_size_for_record(&proto_record);
     let total_entries = 256;
-    let entries_per_file = sz_limit / (entry_sz as u64);
+    let entries_per_file = sz_limit / (entry_sz as i64);
     let total_files_needed = (total_entries as f64 * entry_sz as f64
       / sz_limit as f64)
       .ceil() as usize;
@@ -1461,9 +1475,11 @@ mod tests {
     // returns expected values.
     let sz_limit = 100; // small size limit so we always overflow.
     let data_dir = tempfile::tempdir().unwrap();
-    let cfg = ConfigBuilder::new(&data_dir)
-      .max_file_fize_bytes(sz_limit)
-      .build();
+    let cfg = Config {
+      datadir: data_dir.as_ref().to_path_buf(),
+      file_size_soft_limit_bytes: sz_limit,
+      merge_config: MergeConfig::default(),
+    };
     let mut br = BitRust::open(cfg, MockClock::new()).unwrap();
     let key_vals = (0..1000)
       .map(|_| {
@@ -1485,7 +1501,11 @@ mod tests {
   fn test_creation() {
     setup_logging();
     let data_dir = tempfile::tempdir().unwrap();
-    let cfg = ConfigBuilder::new(&data_dir).build();
+    let cfg = Config {
+      datadir: data_dir.as_ref().to_path_buf(),
+      file_size_soft_limit_bytes: DEFAULT_FILE_SIZE_SOFT_LIMIT_BYTES,
+      merge_config: MergeConfig::default(),
+    };
     let mut br = BitRustState::new(cfg, MockClock::new()).unwrap();
     br.put(b"foo".to_vec(), b"bar".to_vec()).unwrap();
     let r = br.get(b"foo").unwrap().unwrap();
@@ -1496,7 +1516,11 @@ mod tests {
   fn test_locking_of_data_dir() {
     setup_logging();
     let data_dir = tempfile::tempdir().unwrap();
-    let cfg = ConfigBuilder::new(&data_dir).build();
+    let cfg = Config {
+      datadir: data_dir.as_ref().to_path_buf(),
+      file_size_soft_limit_bytes: DEFAULT_FILE_SIZE_SOFT_LIMIT_BYTES,
+      merge_config: MergeConfig::default(),
+    };
     let _br = BitRustState::new(cfg.clone(), MockClock::new()).unwrap();
     let another_br = BitRustState::new(cfg, MockClock::new());
     assert!(another_br.is_err());
@@ -1506,7 +1530,11 @@ mod tests {
   fn test_deletion() {
     setup_logging();
     let data_dir = tempfile::tempdir().unwrap();
-    let cfg = ConfigBuilder::new(&data_dir).build();
+    let cfg = Config {
+      datadir: data_dir.as_ref().to_path_buf(),
+      file_size_soft_limit_bytes: DEFAULT_FILE_SIZE_SOFT_LIMIT_BYTES,
+      merge_config: MergeConfig::default(),
+    };
     let mut br = BitRustState::new(cfg, MockClock::new()).unwrap();
     br.put(b"foo".to_vec(), b"bar".to_vec()).unwrap();
     assert!(br.get(b"foo").unwrap().unwrap() == b"bar");
@@ -1518,8 +1546,12 @@ mod tests {
   fn bench_put(b: &mut Bencher) {
     setup_logging();
     let data_dir = tempfile::tempdir().unwrap();
-    let config = ConfigBuilder::new(&data_dir).build();
-    let mut br = BitRust::open(config, MockClock::new()).unwrap();
+    let cfg = Config {
+      datadir: data_dir.as_ref().to_path_buf(),
+      file_size_soft_limit_bytes: DEFAULT_FILE_SIZE_SOFT_LIMIT_BYTES,
+      merge_config: MergeConfig::default(),
+    };
+    let mut br = BitRust::open(cfg, MockClock::new()).unwrap();
     let key = util::rand_str_with_rand_size().as_bytes().to_vec();
     let val = util::rand_str_with_rand_size().as_bytes().to_vec();
     b.iter(move || {

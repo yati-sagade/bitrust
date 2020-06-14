@@ -4,16 +4,23 @@ extern crate tempfile;
 #[macro_use]
 extern crate log;
 
+use bitrust::config::{
+  Config, MergeConfig, DEFAULT_FILE_SIZE_SOFT_LIMIT_BYTES,
+};
 use bitrust::test_utils::{dump_all_datafiles, setup_logging};
 use bitrust::util::{rand_str_with_rand_size, SerialLogicalClock};
-use bitrust::{BitRust, BitRustState, ConfigBuilder};
+use bitrust::{BitRust, BitRustState};
 use std::collections::HashMap;
 
 #[test]
 fn test_model_based_load_store() {
   setup_logging();
   let data_dir = tempfile::tempdir().unwrap();
-  let cfg = ConfigBuilder::new(&data_dir).build();
+  let cfg = Config {
+    datadir: data_dir.as_ref().to_path_buf(),
+    merge_config: MergeConfig::default(),
+    file_size_soft_limit_bytes: DEFAULT_FILE_SIZE_SOFT_LIMIT_BYTES,
+  };
   let mut br = BitRustState::new(cfg, SerialLogicalClock::new(0)).unwrap();
   let mut model = HashMap::new();
 
@@ -41,9 +48,11 @@ fn test_model_based_load_store_with_restarts() {
     debug!("Start generation {}", i);
     {
       debug!("Generation {}: Opening bitrust", i);
-      let cfg = ConfigBuilder::new(&data_dir)
-        .max_file_fize_bytes(1000)
-        .build();
+      let cfg = Config {
+        datadir: data_dir.as_ref().to_path_buf(),
+        merge_config: MergeConfig::default(),
+        file_size_soft_limit_bytes: 1000,
+      };
       let mut br = BitRust::open(cfg, SerialLogicalClock::new(0)).unwrap();
       debug!("Generation {}: Putting keys", i);
       for key in &keys {
@@ -54,9 +63,11 @@ fn test_model_based_load_store_with_restarts() {
       }
     }
     debug!("Generation {}: Opening bitrust for reading", i);
-    let cfg = ConfigBuilder::new(&data_dir)
-      .max_file_fize_bytes(1000)
-      .build();
+    let cfg = Config {
+      datadir: data_dir.as_ref().to_path_buf(),
+      merge_config: MergeConfig::default(),
+      file_size_soft_limit_bytes: 1000,
+    };
     let mut br = BitRust::open(cfg, SerialLogicalClock::new(0)).unwrap();
     debug!(">>>>>");
     dump_all_datafiles(&br.state).expect("Dump state");
@@ -85,12 +96,14 @@ fn test_model_based_load_store_with_restarts_and_merges() {
   let mut expected_values = HashMap::<String, String>::new();
   {
     let mut br = BitRust::open(
-      ConfigBuilder::new(&data_dir)
+      Config {
+        datadir: data_dir.as_ref().to_path_buf(),
+        merge_config: MergeConfig::default(),
         // We write records of the form foo => foo_[0-9], which makes the entry
         // size 30 bytes. This option makes the active file rotate after each
         // put.
-        .max_file_fize_bytes(30)
-        .build(),
+        file_size_soft_limit_bytes: 30,
+      },
       SerialLogicalClock::new(0),
     )
     .expect("Bitrust open for putting");
@@ -116,9 +129,11 @@ fn test_model_based_load_store_with_restarts_and_merges() {
   }
   debug!("Reopening for reading");
   let mut br = BitRust::open(
-    ConfigBuilder::new(&data_dir)
-      .max_file_fize_bytes(1000)
-      .build(),
+    Config {
+      datadir: data_dir.as_ref().to_path_buf(),
+      merge_config: MergeConfig::default(),
+      file_size_soft_limit_bytes: 1000,
+    },
     SerialLogicalClock::new(0),
   )
   .expect("Bitrust open for putting");

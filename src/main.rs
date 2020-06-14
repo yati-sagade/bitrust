@@ -14,8 +14,11 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
+use bitrust::config::{
+  Config, MergeConfig, DEFAULT_FILE_SIZE_SOFT_LIMIT_BYTES,
+};
 use bitrust::util;
-use bitrust::{BitRust, Config, ConfigBuilder};
+use bitrust::BitRust;
 use simplelog::{CombinedLogger, LevelFilter, TermLogger, WriteLogger};
 
 use bitrust::{Result, ResultExt};
@@ -31,7 +34,7 @@ fn main() -> Result<()> {
   }
 
   let config = build_config(&matches);
-  let datadir = config.datadir().to_path_buf();
+  let datadir = config.datadir.to_path_buf();
 
   setup_logging(&datadir, log_level_filter(&matches))?;
 
@@ -43,14 +46,18 @@ fn main() -> Result<()> {
 
 fn build_config(matches: &getopts::Matches) -> Config {
   let data_dir = datadir(&matches);
-  let mut config = ConfigBuilder::new(data_dir);
+  let mut config = Config {
+    datadir: data_dir,
+    file_size_soft_limit_bytes: DEFAULT_FILE_SIZE_SOFT_LIMIT_BYTES,
+    merge_config: MergeConfig::default(),
+  };
   if let Some(sz) = matches.opt_str("s") {
-    let max_file_fize_bytes = sz.parse::<u64>().unwrap_or_else(|e| {
+    let max_file_fize_bytes = sz.parse::<i64>().unwrap_or_else(|e| {
       panic!("Invalid value {} for -s: {:?}", sz, e);
     });
-    config.max_file_fize_bytes(max_file_fize_bytes);
+    config.file_size_soft_limit_bytes = max_file_fize_bytes;
   }
-  config.build()
+  config
 }
 
 fn prompt() -> Result<()> {

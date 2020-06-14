@@ -25,6 +25,8 @@ isatty = "0.1.9"
 num = "0.2.0"
 protobuf = "2.14.0"
 dirs = "2.0"
+serde = {version = "1.0", features = ["derive"]}
+toml = "0.5.6"
 
 [dev-dependencies]
 criterion = "0.3"
