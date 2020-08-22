@@ -12,9 +12,18 @@ error_chain! { // comes from crate error_chain
             description("Invalid/unknown file kind"),
             display("Invalid file kind: {}", msg)
         }
+        InvalidArgument(msg: String) {
+            description("Invalid argument"),
+            display("Invalid argument(s): {}", msg)
+        }
+        LockPoisoned(msg: String) {
+            description("Lock poisoned"),
+            display("Lock poisoned: {}", msg)
+        }
     }
     foreign_links {
         Io(::std::io::Error) #[cfg(unix)];
         Proto(::protobuf::ProtobufError);
+        UTF8(std::string::FromUtf8Error);
     }
 }

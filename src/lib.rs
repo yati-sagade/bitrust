@@ -3,6 +3,7 @@
 extern crate byteorder;
 extern crate bytes;
 extern crate crc;
+extern crate crossbeam;
 extern crate num;
 extern crate protobuf;
 extern crate rand;
@@ -34,9 +35,10 @@ use std::io::{self, BufReader, Seek, SeekFrom};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::atomic;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
+use crossbeam::channel as chan;
 use protobuf::Message;
 
 pub use common::{BitrustOperation, FileID, BITRUST_TOMBSTONE_STR};
@@ -174,22 +176,11 @@ type HintFileReader = FileBasedRecordReader<bitrust_pb::HintFileRecord>;
 
 #[derive(Debug)]
 pub struct BitRustState<ClockT> {
-  keydir: KeyDir,
-  active_file: ActiveFile,
-
-  inactive_files: HashMap<FileID, InactiveFile>,
-
+  keydir: Arc<RwLock<KeyDir>>,
+  active_file: Arc<RwLock<ActiveFile>>,
+  inactive_files: Arc<RwLock<HashMap<FileID, InactiveFile>>>,
   lockfile: lockfile::LockFile,
-
-  // mutex for writers. There is an additional R/W lock at the keydir level
-  // (see keydir::KeyDir) which takes care of concurrent updates of the
-  // keydir. This lock is to synchronize writes since they involve writing
-  // to data files (as opposed to reads, which read immutable records from
-  // those files).
-  mutex: Arc<Mutex<()>>,
-
   config: Config,
-
   // Apart from the initialization code, this is used by put() to overflow
   // data files (i.e., to start a new active file when the current one
   // becomes too big), and by merge(), to get a name for the merge output
@@ -197,14 +188,63 @@ pub struct BitRustState<ClockT> {
   //
   // When a write and a merge are happening concurrently, access to this
   // needs to be synchronized using `mutex` above.
-  data_file_id_gen: util::FileIDGen,
+  data_file_id_gen: Arc<Mutex<util::FileIDGen>>,
+  clock: Arc<Mutex<ClockT>>,
+  merge_thread: Option<std::thread::JoinHandle<()>>,
+  merge_stopchan: Option<chan::Sender<()>>,
+}
 
-  clock: Arc<ClockT>,
+fn setup_bitrust(config: &Config) -> Result<PathBuf> {
+  let ptr_path = active_file_pointer_path(&config.datadir);
+  debug!(
+    "Starting in an empty data directory, writing {:?}",
+    &ptr_path
+  );
+  let first_active_file =
+    util::FileKind::DataFile.path_from_id(0, &config.datadir);
+  debug!("First active file name {:?}", &first_active_file);
+  debug!("To str: {:?}", first_active_file.to_str().unwrap());
+  util::write_to_file(
+    &ptr_path,
+    first_active_file
+      .to_str()
+      .expect("Garbled initial data file name"),
+  )
+  .chain_err(|| {
+    format!(
+      "Failed to write active file name to the\
+           pointer file {:?}",
+      &ptr_path
+    )
+  })?;
+  Ok(first_active_file)
+}
+
+fn read_inactive_files(
+  dd_contents: util::DataDirContents,
+  active_file_id: FileID,
+) -> Result<HashMap<FileID, InactiveFile>> {
+  let mut inactive_files = HashMap::new();
+  for (file_id, dd_entry) in dd_contents {
+    if file_id == active_file_id {
+      continue;
+    }
+    let inactive_file = InactiveFile::new(dd_entry.data_file_path().clone())
+      .chain_err(|| {
+        format!(
+          "Failed to open inactive file at {:?} for\
+               reading into keydir",
+          dd_entry.data_file_path()
+        )
+      })?;
+    inactive_files.insert(file_id, inactive_file);
+  }
+  Ok(inactive_files)
 }
 
 impl<ClockT> BitRustState<ClockT>
 where
-  ClockT: util::LogicalClock,
+  ClockT: util::LogicalClock + Send + Sync + 'static,
 {
   pub fn new(
     config: Config,
@@ -249,223 +289,136 @@ where
         )
       })?;
 
-    let (latest_timestamp, keydir) = if dd_contents.len() == 0 {
-      // We are starting from scratch, write the name of the active file
-      // as 0.data.
-      let ptr_path = active_file_pointer_path(&config.datadir);
-      debug!(
-        "Starting in an empty data directory, writing {:?}",
-        &ptr_path
-      );
-      util::write_to_file(
-        &ptr_path,
-        util::FileKind::DataFile
-          .path_from_id(0, &config.datadir)
-          .to_str()
-          .expect("Garbled initial data file name"),
-      )
-      .chain_err(|| {
-        format!(
-          "Failed to write active file name to the\
-           pointer file {:?}",
-          &ptr_path
-        )
-      })?;
-
-      (0u64, KeyDir::new())
+    let (latest_timestamp, keydir, active_file_name) = if dd_contents.is_empty()
+    {
+      let active_file_name = setup_bitrust(&config)?;
+      (0u64, KeyDir::new(), active_file_name)
     } else {
       debug!("Now building keydir with these files: {:?}", &dd_contents);
-      // We should probably build the keydir and the `active_file` and
-      // `inactive_file` fields together, but it is just simpler to first
-      // build the keydir and then do another pass to build the other fields.
-      build_keydir(&dd_contents)?
+      let (latest_timestamp, keydir) = build_keydir(&dd_contents)?;
+      let active_file_name = active_file_path(&config.datadir)?;
+      (latest_timestamp, keydir, active_file_name)
     };
+
     debug!("Done building keydir: {:?}", &keydir.entries);
 
-    let active_file_name = active_file_path(&config.datadir)?;
     debug!("Using active file {:?}", &active_file_name);
     let active_file =
       ActiveFile::new(active_file_name.clone()).chain_err(|| {
         format!("Could not open active file {:?}", &active_file_name)
       })?;
-    let mut inactive_files = HashMap::new();
-    for (file_id, dd_entry) in dd_contents {
-      if file_id != active_file.id {
-        let inactive_file = InactiveFile::new(
-          dd_entry.data_file_path().clone(),
-        )
-        .chain_err(|| {
-          format!(
-            "Failed to open inactive file at {:?} for\
-               reading into keydir",
-            dd_entry.data_file_path()
-          )
-        })?;
-        inactive_files.insert(file_id, inactive_file);
-      }
-    }
     let active_file_id = active_file.id;
+    let inactive_files = read_inactive_files(dd_contents, active_file_id)?;
     clock.set_next(latest_timestamp + 1);
-    let bitrust = BitRustState {
-      keydir,
-      config: config,
-      inactive_files: inactive_files,
-      active_file: active_file,
+    let mut bitrust = BitRustState {
+      keydir: Arc::new(RwLock::new(keydir)),
+      config: config.clone(),
+      inactive_files: Arc::new(RwLock::new(inactive_files)),
+      active_file: Arc::new(RwLock::new(active_file)),
       lockfile,
-      mutex: Arc::new(Mutex::new(())),
-      data_file_id_gen: util::FileIDGen::new(active_file_id + 1),
-      clock: Arc::new(clock),
+      data_file_id_gen: Arc::new(Mutex::new(util::FileIDGen::new(
+        active_file_id + 1,
+      ))),
+      clock: Arc::new(Mutex::new(clock)),
+      merge_thread: None,
+      merge_stopchan: None,
     };
+
+    if let Some(auto_merge_cfg) = config.merge_config.auto_merge_config {
+      debug!("Automatic merging enabled: {:?}", &auto_merge_cfg);
+      let (joinhandle, stopchan) = bitrust.start_merge_thread(
+        std::time::Duration::from_secs(auto_merge_cfg.check_interval_secs),
+      );
+      bitrust.merge_thread = Some(joinhandle);
+      bitrust.merge_stopchan = Some(stopchan);
+    }
+
     debug!("Returning from BitRustState::new");
     Ok(bitrust)
   }
 
-  pub fn active_file_id(&self) -> FileID {
-    self.active_file.id
-  }
+  // Starts a thread that periodically runs merge if required.
+  // Returns a handle to join on the the thread, and a sender half of a channel
+  // which should receive a unit value `()` to signal stop.
+  // Clients should first send a unit value on this channel, and then join on
+  // the returned handle. Ongoing merges will be finished before the function
+  // returns.
+  fn start_merge_thread(
+    &self,
+    check_interval: std::time::Duration,
+  ) -> (std::thread::JoinHandle<()>, chan::Sender<()>) {
+    let keydir = self.keydir.clone();
+    let inactive_files = self.inactive_files.clone();
+    let idgen = self.data_file_id_gen.clone();
 
-  /// Returns a vector of `(file_id, path_to_file)` tuples, sorted ascending
-  /// by `file_id`.
-  fn get_files_for_merging(&self) -> Vec<(FileID, PathBuf)> {
-    let mut files_to_merge: Vec<(FileID, PathBuf)> = self
-      .inactive_files
-      .keys()
-      .cloned()
-      .map(|id| {
-        (
-          id,
-          util::FileKind::DataFile.path_from_id(id, &self.config.datadir),
-        )
-      })
-      .collect();
+    // Use a buffered channel for letting the main thread signal bedtime.
+    // An unbuffered channel (with capacity 0) will cause Sender::try_send() to
+    // fail if there is no active Receiver::recv(). This will happen if the main
+    // thread sends a stop signal while we are in the merge() function below.
+    // This will prevent the merge thread from ever going down.
+    let (sender, receiver) = chan::bounded(1);
 
-    // Sort the above tuples by file id
-    files_to_merge.sort_by(|a, b| a.0.cmp(&b.0));
-    files_to_merge
-  }
-
-  // XXX: Partial merges, i.e., when we operate only on a subset of the
-  // datafiles, is not implemented yet. It is important because if the
-  // merge process gets a random error from the OS when opening/reading
-  // one of the data files, the merge can still continue with the other
-  // files, degrading into a partial merge. It differs from a total merge
-  // mostly in the handling of tombstone values. In a partial merge, when
-  // a key is seen with a tombstone, one can not just drop it, as there
-  // might be a newer file that contains a non-tombstone value for the
-  // key.
-  pub fn merge(&mut self) -> Result<()> {
-    // Try to get a merge-lock on the active directory.
-    // Go through the files in ascending order of ids
-    let _merge_lockfile =
-      locking::acquire(&self.config.datadir, BitrustOperation::Merge)
-        .chain_err(|| {
-          format!("Failed to acquire merge lock in {:?}", &self.config.datadir)
-        })?;
-
-    debug!("Acquired merge lockfile");
-
-    // Open all the mergefiles and fail early if we cannot open any.
-    // This is where a partial merge would have proceeded with the files we
-    // could open (see the note above).
-
-    let merge_files: Vec<InactiveFile> = {
-      let files_to_merge = self.get_files_for_merging();
-      debug!("Going to merge these files: {:?}", &files_to_merge);
-
-      let mut merge_files = Vec::new();
-      for (id, file_path) in files_to_merge.into_iter() {
-        // TODO: partial merges even if we fail to open some files.
-        let merge_file =
-          InactiveFile::new(file_path.clone()).chain_err(|| {
-            format!(
-              "Failed to open inactive file id {} ({:?}) for merging",
-              id, &file_path
-            )
-          })?;
-        merge_files.push(merge_file);
+    let config = self.config.clone();
+    let t = std::thread::spawn(move || loop {
+      match receiver.recv_timeout(check_interval) {
+        Ok(_) | Err(chan::RecvTimeoutError::Disconnected) => {
+          info!("Merge thread going down");
+          break;
+        }
+        Err(chan::RecvTimeoutError::Timeout) => {
+          info!("Merging..");
+          if let Err(e) = merge(
+            keydir.clone(),
+            inactive_files.clone(),
+            idgen.clone(),
+            config.clone(),
+            false,
+          ) {
+            warn!("Error merging: {:?}", e);
+          }
+        }
       }
-      merge_files
-    };
-
-    let datadir = &self.config.datadir;
-
-    let mut merge_output_file = {
-      let mutex = self.mutex.clone();
-      let merge_output_file_id = {
-        let _lock = mutex.lock().unwrap();
-        self.data_file_id_gen.take_next()
-      };
-      let merge_output_file_name =
-        util::FileKind::DataFile.path_from_id(merge_output_file_id, datadir);
-
-      let merge_active_file =
-        ActiveFile::new(merge_output_file_name.clone())
-          .chain_err(|| "Failed to open a new merge file for writing")?;
-
-      // We will also open an InactiveFile and make it known to the bitrust
-      // state, since we will incrementally "port" keys from their current
-      // files to the new merge file.
-      let merge_inactive_file = InactiveFile::new(merge_output_file_name)
-        .chain_err(|| "Failed to open merge file for reading")?;
-
-      self
-        .inactive_files
-        .insert(merge_inactive_file.id, merge_inactive_file);
-
-      merge_active_file
-    };
-
-    let mut hint_file_writer = HintFileWriter::new(
-      util::FileKind::HintFile.path_from_id(merge_output_file.id, datadir),
-    )?;
-
-    let mut all_merge_file_ids = HashSet::<FileID>::new();
-
-    all_merge_file_ids.insert(merge_output_file.id);
-
-    // Read records sequentially from the file.
-    // If record.key does not exist in our keydir, move on.
-    // If record.key exists, but the filename in the record does not match the
-    // file we are merging
-    for data_file in merge_files.into_iter() {
-      let data_file_id = data_file.id;
-      merge_one_file(
-        &mut self.keydir,
-        data_file,
-        &mut all_merge_file_ids,
-        &mut self.inactive_files,
-        self.mutex.clone(),
-        &mut self.data_file_id_gen,
-        &self.config,
-        &mut merge_output_file,
-        &mut hint_file_writer,
-      )?;
-      let data_file_path =
-        util::FileKind::DataFile.path_from_id(data_file_id, datadir);
-      debug!("Now removing {:?} after merge", &data_file_path);
-      fs::remove_file(&data_file_path).chain_err(|| {
-        format!(
-          "Could not remove file {:?} after merge to file id {:?}",
-          &data_file_path, &merge_output_file.id
-        )
-      })?;
-      self.inactive_files.remove(&data_file_id);
-    }
-    Ok(())
+    });
+    (t, sender)
   }
 
-  pub fn put(&mut self, key: Vec<u8>, val: Vec<u8>) -> Result<()> {
-    let _lock = self.mutex.lock().unwrap();
-    let timestamp_now = Arc::get_mut(&mut self.clock)
-      .expect("Failed to get clock for logical timestamps")
-      .tick();
+  pub fn active_file_id(&self) -> FileID {
+    self.active_file.read().expect("Lock on active file").id
+  }
+
+  pub fn merge(&self, force_merge: bool) -> Result<()> {
+    merge(
+      self.keydir.clone(),
+      self.inactive_files.clone(),
+      self.data_file_id_gen.clone(),
+      self.config.clone(),
+      force_merge,
+    )
+  }
+
+  pub fn put(&self, key: Vec<u8>, val: Vec<u8>) -> Result<()> {
+    let mut clock = self.clock.lock().expect("Lock on clock for put");
+    let mut keydir = self.keydir.write().expect("Write lock on keydir for put");
+    let mut active_file = self
+      .active_file
+      .write()
+      .expect("Write lock on active_file for put");
+    let mut inactive_files = self
+      .inactive_files
+      .write()
+      .expect("Write lock on inactive_files for put");
+    let mut file_id_gen = self
+      .data_file_id_gen
+      .lock()
+      .expect("Write lock on fileidgen for put");
+
+    let timestamp_now = clock.tick();
     let mut record = bitrust_pb::BitRustDataRecord::new();
     record.set_timestamp(timestamp_now);
     record.set_key(key.clone());
     record.set_value(val);
 
-    let (offset, size) = self
-      .active_file
+    let (offset, size) = active_file
       .append_record(&record)
       .chain_err(|| "Failed to write record to active file")?;
 
@@ -476,15 +429,14 @@ where
       offset
     );
 
-    self.keydir.insert(
+    keydir.insert(
       key,
-      KeyDirEntry::new(self.active_file.id, size as u16, offset, timestamp_now),
+      KeyDirEntry::new(active_file.id, size as u16, offset, timestamp_now),
     );
 
     debug!(
       "After this write, active file is {} bytes",
-      self
-        .active_file
+      active_file
         .tell()
         .chain_err(|| "Failed to ftell() active file to get current offset")?
     );
@@ -495,13 +447,10 @@ where
     //
     // This is also why maybe_seal_active_file() is a function accepting
     // our fields mutably rather than a method on &mut self.
-    let inactive_files = &mut self.inactive_files;
-    let active_file = &mut self.active_file;
     let config = &self.config;
-    let file_id_gen = &mut self.data_file_id_gen;
 
     if let Some(inactive_file) =
-      maybe_rotate_output(active_file, config, file_id_gen)?
+      maybe_rotate_output(&mut active_file, config, &mut file_id_gen)?
     {
       inactive_files.insert(inactive_file.id, inactive_file);
       update_active_file_id(active_file.id, config)?;
@@ -509,23 +458,31 @@ where
     Ok(())
   }
 
-  pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-    let entry = self.keydir.get(key);
+  pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    let keydir = self.keydir.read().expect("rlock on keydir for get");
+    let mut active_file = self
+      .active_file
+      .write()
+      .expect("rlock on active_file for read");
+    let mut inactive_files = self
+      .inactive_files
+      .write()
+      .expect("rlock on inactive_files for read");
+    let entry = keydir.get(key);
 
     if let Some(entry) = entry {
       let record: bitrust_pb::BitRustDataRecord =
-        if entry.file_id == self.active_file.id {
+        if entry.file_id == active_file.id {
           debug!(
             "Fetching from active file (id {}), at offset {}",
             entry.file_id, entry.record_offset
           );
-          self
-            .active_file
+          active_file
             .read_record(entry.record_offset, entry.record_size as u64)
             .chain_err(|| {
               format!(
                 "Failed to read record from active file ({:?})",
-                &self.active_file.path
+                &active_file.path
               )
             })?
         } else {
@@ -534,12 +491,11 @@ where
           // we don't know about is bad.
           debug!("Fetching from inactive file id {}", entry.file_id);
 
-          let file =
-            self.inactive_files.get_mut(&entry.file_id).ok_or(format!(
-              "Got a request for inactive file id {}, but \
+          let file = inactive_files.get_mut(&entry.file_id).ok_or(format!(
+            "Got a request for inactive file id {}, but \
                it was not loaded, this is really bad!",
-              entry.file_id
-            ))?;
+            entry.file_id
+          ))?;
 
           file
             .read_record(entry.record_offset, entry.record_size as u64)
@@ -564,12 +520,13 @@ where
     }
   }
 
-  pub fn delete(&mut self, key: &[u8]) -> Result<()> {
+  pub fn delete(&self, key: &[u8]) -> Result<()> {
     self.put(key.to_vec(), BITRUST_TOMBSTONE_STR.to_vec())
   }
 
-  pub fn keys<'a>(&'a self) -> Vec<&'a [u8]> {
-    self.keydir.keys()
+  pub fn keys<'a>(&'a self) -> Vec<Vec<u8>> {
+    let keydir = self.keydir.read().expect("rlock on keydir for keys");
+    keydir.keys().iter().cloned().map(Vec::from).collect()
   }
 }
 
@@ -780,7 +737,7 @@ impl<ClockT> Drop for BitRust<ClockT> {
 
 impl<ClockT> BitRust<ClockT>
 where
-  ClockT: util::LogicalClock,
+  ClockT: util::LogicalClock + Send + Sync + 'static,
 {
   pub fn open(config: Config, clock: ClockT) -> Result<BitRust<ClockT>> {
     let state = BitRustState::new(config, clock)?;
@@ -788,34 +745,32 @@ where
     Ok(BitRust { state, running })
   }
 
-  pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+  pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
     debug_timeit!("get" => {
         self.state.get(key)
     })
   }
 
-  pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+  pub fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
     debug_timeit!("put" => {
         self.state.put(key, value)
     })
   }
 
-  pub fn delete(&mut self, key: &[u8]) -> Result<()> {
+  pub fn delete(&self, key: &[u8]) -> Result<()> {
     debug_timeit!("delete" => {
         self.state.delete(key)
     })
   }
 
-  pub fn keys<'a>(&'a self) -> Vec<&'a [u8]> {
+  pub fn keys<'a>(&'a self) -> Vec<Vec<u8>> {
     debug_timeit!("keys" => {
         self.state.keys()
     })
   }
 
-  pub fn merge(&mut self) -> Result<()> {
-    debug_timeit!("merge" => {
-        self.state.merge()
-    })
+  pub fn merge(&self) -> Result<()> {
+    self.state.merge(/*force_merge=*/ true)
   }
 }
 
@@ -850,12 +805,11 @@ fn write_hint_record(
 }
 
 fn merge_one_file(
-  keydir: &mut KeyDir,
+  keydir: Arc<RwLock<KeyDir>>,
   mut data_file: InactiveFile,
   all_merge_file_ids: &mut HashSet<FileID>,
-  inactive_files: &mut HashMap<FileID, InactiveFile>,
-  mutex: Arc<Mutex<()>>,
-  file_id_gen: &mut util::FileIDGen,
+  inactive_files: Arc<RwLock<HashMap<FileID, InactiveFile>>>,
+  file_id_gen: Arc<Mutex<util::FileIDGen>>,
   config: &Config,
   merge_output_file: &mut ActiveFile,
   hint_file_writer: &mut HintFileWriter,
@@ -867,9 +821,18 @@ fn merge_one_file(
   'record_loop: while let Some(record) = data_file.next_record()? {
     if is_recordio_overlimit(merge_output_file, config)? {
       {
-        let _lock = mutex.lock().expect("Lock to try sealing mergefile");
-        rotate_output(merge_output_file, file_id_gen.take_next(), config)
-          .map(|f| inactive_files.insert(f.id, f))?;
+        // chan: get next file id
+        // perform rotation
+        // chan: add new mergefile to inactive files
+        let new_file_id = file_id_gen
+          .lock()
+          .expect("Lock on file_id_gen to rotate mergefile")
+          .take_next(); // chan
+        let mut inactive_files = inactive_files
+          .write()
+          .expect("write lock on inactive_files for merge file rotation");
+        rotate_output(merge_output_file, new_file_id, config)
+          .map(|f| inactive_files.insert(f.id, f))?; // chan
         all_merge_file_ids.insert(merge_output_file.id);
         rotate_output(hint_file_writer, merge_output_file.id, config)?;
         // Also need to add the new active file as an inactive file to
@@ -877,12 +840,16 @@ fn merge_one_file(
         let merge_inactive_file =
           InactiveFile::new(merge_output_file.path.clone())
             .chain_err(|| "Creating an InactiveFile for the new merge file")?;
-        inactive_files.insert(merge_inactive_file.id, merge_inactive_file);
+        inactive_files.insert(merge_inactive_file.id, merge_inactive_file); // chan
       }
     }
+    let mut keydir = keydir
+      .write()
+      .expect("write lock on keydir to write merge record");
     // Name of the file that the keydir points to for this key.
     if let Some(curr_ts) =
       keydir.get(record.get_key()).map(|entry| entry.timestamp)
+    // chan
     {
       if curr_ts > record.get_timestamp() {
         // We have a newer record in the keydir.
@@ -938,7 +905,7 @@ fn merge_one_file(
           data_file.id == old_keydir_entry.file_id
             || all_merge_file_ids.contains(&old_keydir_entry.file_id)
         },
-      );
+      ); // chan
       if write_successful {
         if let Err(e) = write_hint_record(
           hint_file_writer,
@@ -983,6 +950,196 @@ fn merge_one_file(
   Ok(())
 }
 
+fn get_files_for_merging(
+  inactive_files: &HashMap<FileID, InactiveFile>,
+  config: &Config,
+) -> Vec<(FileID, PathBuf)> {
+  let mut files_to_merge = inactive_files
+    .keys()
+    .cloned()
+    .map(|id| {
+      (
+        id,
+        util::FileKind::DataFile.path_from_id(id, &config.datadir),
+      )
+    })
+    .collect::<Vec<_>>();
+  // Sort the above tuples by file id
+  files_to_merge.sort_by(|a, b| a.0.cmp(&b.0));
+  files_to_merge
+}
+
+// XXX: Partial merges, i.e., when we operate only on a subset of the
+// datafiles, is not implemented yet. It is important because if the
+// merge process gets a random error from the OS when opening/reading
+// one of the data files, the merge can still continue with the other
+// files, degrading into a partial merge. It differs from a total merge
+// mostly in the handling of tombstone values. In a partial merge, when
+// a key is seen with a tombstone, one can not just drop it, as there
+// might be a newer file that contains a non-tombstone value for the
+// key.
+fn merge(
+  keydir: Arc<RwLock<KeyDir>>,
+  inactive_files: Arc<RwLock<HashMap<FileID, InactiveFile>>>,
+  idgen: Arc<Mutex<util::FileIDGen>>,
+  config: Config,
+  force_merge: bool,
+) -> Result<()> {
+  // Try to get a merge-lock on the active directory.
+  // Go through the files in ascending order of ids
+  let _merge_lockfile =
+    locking::acquire(&config.datadir, BitrustOperation::Merge).chain_err(
+      || format!("Failed to acquire merge lock in {:?}", config.datadir),
+    )?;
+
+  debug!("Acquired merge lockfile");
+  let merge_files: Vec<InactiveFile> = {
+    let files_to_merge = {
+      let inactive_files = inactive_files
+        .read()
+        //.map_err(|e| ErrorKind::LockPoisoned(format!("{}", e)).into())?;
+        .expect("get inactive files for merge");
+      get_files_for_merging(&inactive_files, &config)
+    };
+    debug!("Going to merge these files: {:?}", &files_to_merge);
+    let mut merge_files = Vec::new(); // chan
+    for (id, file_path) in files_to_merge.into_iter() {
+      // TODO: partial merges even if we fail to open some files.
+      let merge_file =
+        InactiveFile::new(file_path.clone()).chain_err(|| {
+          format!(
+            "Failed to open inactive file id {} ({:?}) for merging",
+            id, &file_path
+          )
+        })?;
+      merge_files.push(merge_file);
+    }
+    merge_files
+  };
+
+  if !force_merge {
+    if let Some(ref auto_merge_cfg) = &config.merge_config.auto_merge_config {
+      if merge_files.len() < auto_merge_cfg.min_inactive_files as usize {
+        info!(
+          "Merge not proceeding because current inactive files: {},\
+                 minimum inactive files for merge: {}",
+          merge_files.len(),
+          auto_merge_cfg.min_inactive_files
+        );
+        return Ok(());
+      }
+    }
+  }
+
+  let datadir = &config.datadir;
+  let mut merge_output_file = {
+    let merge_output_file_id = {
+      idgen
+        .lock()
+        //.map_err(|e| {
+        //  ErrorKind::LockPoisoned(format!("idgen for merge {}", e)).into()
+        //})?
+        .expect("idgen for merge")
+        .take_next()
+    };
+    let merge_output_file_name =
+      util::FileKind::DataFile.path_from_id(merge_output_file_id, datadir);
+
+    let merge_active_file = ActiveFile::new(merge_output_file_name.clone())
+      .chain_err(|| "Failed to open a new merge file for writing")?;
+
+    // We will also open an InactiveFile and make it known to the bitrust
+    // state, since we will incrementally "port" keys from their current
+    // files to the new merge file.
+    let merge_inactive_file = InactiveFile::new(merge_output_file_name)
+      .chain_err(|| "Failed to open merge file for reading")?;
+
+    inactive_files
+      .write()
+      //.map_err(|e| {
+      //  ErrorKind::LockPoisoned(format!(
+      //    "writing inactive_files for merge {}",
+      //    e
+      //  ))
+      //  .into()
+      //})?
+      .expect("inactive files for merge")
+      .insert(merge_inactive_file.id, merge_inactive_file);
+    merge_active_file
+  };
+  let mut hint_file_writer = HintFileWriter::new(
+    util::FileKind::HintFile.path_from_id(merge_output_file.id, datadir),
+  )?;
+
+  let mut all_merge_file_ids = HashSet::<FileID>::new();
+
+  all_merge_file_ids.insert(merge_output_file.id);
+
+  // Read records sequentially from the file.
+  // If record.key does not exist in our keydir, move on.
+  // If record.key exists, but the filename in the record does not match the
+  // file we are merging
+  for data_file in merge_files.into_iter() {
+    let data_file_id = data_file.id;
+    merge_one_file(
+      keydir.clone(),
+      data_file,
+      &mut all_merge_file_ids,
+      inactive_files.clone(),
+      idgen.clone(),
+      &config,
+      &mut merge_output_file,
+      &mut hint_file_writer,
+    )?;
+    let data_file_path =
+      util::FileKind::DataFile.path_from_id(data_file_id, datadir);
+    debug!("Now removing {:?} after merge", &data_file_path);
+    fs::remove_file(&data_file_path).chain_err(|| {
+      format!(
+        "Could not remove file {:?} after merge to file id {:?}",
+        &data_file_path, &merge_output_file.id
+      )
+    })?;
+    let hint_file_path =
+      util::FileKind::HintFile.path_from_id(data_file_id, datadir);
+    if let Err(e) = fs::remove_file(&hint_file_path) {
+      if e.kind() != std::io::ErrorKind::NotFound {
+        warn!("Error removing hint file {:?}: {:?}", &hint_file_path, e);
+      }
+    }
+
+    inactive_files
+      .write()
+      //.map_err(|e| {
+      //  ErrorKind::LockPoisoned(format!(
+      //    "writing inactive_files for merge {}",
+      //    e
+      //  ))
+      //  .into()
+      //})?
+      .expect("inactive files for merge")
+      .remove(&data_file_id);
+  }
+  Ok(())
+}
+
+impl<ClockT> Drop for BitRustState<ClockT> {
+  fn drop(&mut self) {
+    info!("Dropping BitRustState");
+    if let Some(merge_stopchan) = &self.merge_stopchan {
+      if let Err(e) = merge_stopchan.try_send(()) {
+        error!("Error sending stop signal to merge thread: {:?}", e);
+      }
+    }
+    if let Some(merge_thread) = self.merge_thread.take() {
+      info!("Waiting for merge thread to finish");
+      if let Err(e) = merge_thread.join() {
+        error!("Error joining on merge thread: {:?}", e);
+      }
+    }
+  }
+}
+
 pub mod test_utils {
   use super::*;
   extern crate simplelog;
@@ -1016,12 +1173,15 @@ pub mod test_utils {
 
   pub fn dump_all_datafiles<T>(state: &BitRustState<T>) -> Result<()> {
     debug!("Inactive files:");
-    let mut file_ids = state.inactive_files.keys().collect::<Vec<_>>();
+    let inactive_files = state.inactive_files.read().unwrap();
+    let mut file_ids = inactive_files.keys().collect::<Vec<_>>();
     file_ids.sort();
     for id in file_ids {
       dump_datafile(
         state
           .inactive_files
+          .read()
+          .unwrap()
           .get(&id)
           .expect("InactiveFile entry")
           .path
@@ -1029,7 +1189,7 @@ pub mod test_utils {
       )?;
     }
     debug!("Active file:");
-    dump_datafile(state.active_file.path.clone())
+    dump_datafile(state.active_file.read().unwrap().path.clone())
   }
 }
 
@@ -1105,9 +1265,9 @@ mod tests {
       file_size_soft_limit_bytes: sz_limit,
       merge_config: MergeConfig::default(),
     };
-    let mut br = BitRust::open(cfg, SerialLogicalClock::new(0)).unwrap();
+    let br = BitRust::open(cfg, SerialLogicalClock::new(0)).unwrap();
     let mut i = 0;
-    while br.state.active_file.id != 2 {
+    while br.state.active_file_id() != 2 {
       br.put(
         format!("foo_{:02}", i).into_bytes(),
         format!("foo_{:02}", i).into_bytes(),
@@ -1116,17 +1276,18 @@ mod tests {
       i += 1;
     }
     br.merge().expect("Merge");
+    let inactive_files = br.state.inactive_files.read().unwrap();
     assert!(
-      br.state.inactive_files.len() == 2,
+      inactive_files.len() == 2,
       "Expected 2 merge files after merge, but {} were found",
-      br.state.inactive_files.len()
+      inactive_files.len()
     );
     assert!(
-      br.state.inactive_files.contains_key(&3),
+      inactive_files.contains_key(&3),
       "Expected merge file with id 3"
     );
     assert!(
-      br.state.inactive_files.contains_key(&4),
+      inactive_files.contains_key(&4),
       "Expected merge file with id 4"
     );
   }
@@ -1151,9 +1312,9 @@ mod tests {
       file_size_soft_limit_bytes: sz_limit,
       merge_config: MergeConfig::default(),
     };
-    let mut br = BitRust::open(cfg, SerialLogicalClock::new(0)).unwrap();
+    let br = BitRust::open(cfg, SerialLogicalClock::new(0)).unwrap();
     let mut i = 0;
-    while br.state.active_file.id != 2 {
+    while br.state.active_file_id() != 2 {
       br.put(b"foo".to_vec(), format!("foo_{:02}", i).into_bytes())
         .expect(&format!("Put foo => foo_{:02}", i));
       i += 1;
@@ -1164,18 +1325,18 @@ mod tests {
     debug!("After first merge");
     dump_all_datafiles(&br.state).expect("Dump datafiles");
     assert!(
-      br.state.active_file.id == 2,
+      br.state.active_file_id() == 2,
       "Expected active file id to be 2, but found {}",
-      br.state.active_file.id
+      br.state.active_file_id()
     );
     let mut last_val = String::from("");
-    while br.state.active_file.id == 2 {
+    while br.state.active_file_id() == 2 {
       last_val = format!("foo_{:02}", i);
       br.put(b"foo".to_vec(), last_val.clone().into_bytes())
         .expect(&format!("Put foo => foo_{:02}", i));
       i += 1;
     }
-    debug!("New active file id: {}", br.state.active_file.id);
+    debug!("New active file id: {}", br.state.active_file_id());
     debug!("After filling, before second merge:");
     dump_all_datafiles(&br.state).expect("Dump datafiles");
     br.merge().expect("Second merge");
@@ -1200,7 +1361,7 @@ mod tests {
       file_size_soft_limit_bytes: sz_limit,
       merge_config: MergeConfig::default(),
     };
-    let mut br = BitRust::open(cfg, MockClock::new()).unwrap();
+    let br = BitRust::open(cfg, MockClock::new()).unwrap();
     let keys = vec!["foo".to_string(), "bar".to_string(), "baz".to_string()];
     let num_writes = 4;
     for version in 0..num_writes {
@@ -1213,11 +1374,14 @@ mod tests {
     // Trigger a merge and then assert we have the latest versions of the
     // keys only.
     br.merge().unwrap();
-    debug!(
-      "After merge, inactive files={:?}, keydir={:?}",
-      br.state.inactive_files.keys().cloned().collect::<Vec<_>>(),
-      &br.state.keydir,
-    );
+    {
+      let inactive_files = br.state.inactive_files.read().unwrap();
+      debug!(
+        "After merge, inactive files={:?}, keydir={:?}",
+        inactive_files.keys().cloned().collect::<Vec<_>>(),
+        &br.state.keydir,
+      );
+    }
     for key in &keys {
       let expected_val = format!("{}_{:02}", key, num_writes - 1).into_bytes();
       let val = br.get(key.as_bytes()).unwrap().unwrap();
@@ -1315,7 +1479,7 @@ mod tests {
         file_size_soft_limit_bytes: sz_limit,
         merge_config: MergeConfig::default(),
       };
-      let mut br = BitRust::open(cfg, SerialLogicalClock::new(0)).unwrap();
+      let br = BitRust::open(cfg, SerialLogicalClock::new(0)).unwrap();
       br.put(b"foo".to_vec(), b"bar".to_vec())
         .expect("put to bitrust");
     }
@@ -1324,7 +1488,7 @@ mod tests {
       file_size_soft_limit_bytes: sz_limit,
       merge_config: MergeConfig::default(),
     };
-    let mut br = BitRust::open(cfg, SerialLogicalClock::new(0)).unwrap();
+    let br = BitRust::open(cfg, SerialLogicalClock::new(0)).unwrap();
     let read_val = br.get(b"foo").expect("Get key foo from bitrust");
     assert!(
       Some(b"bar".to_vec()) == read_val,
@@ -1344,7 +1508,7 @@ mod tests {
       file_size_soft_limit_bytes: sz_limit,
       merge_config: MergeConfig::default(),
     };
-    let mut br = BitRust::open(cfg, MockClock::new()).unwrap();
+    let br = BitRust::open(cfg, MockClock::new()).unwrap();
     let mut clock = MockClock::new();
     clock.set_next(42);
     let mut proto_record = bitrust_pb::BitRustDataRecord::new();
@@ -1382,7 +1546,9 @@ mod tests {
     let active_file_pointer_path = active_file_pointer_path(&data_dir);
     let persisted_active_file_name =
       PathBuf::from(util::read_from_file(active_file_pointer_path).unwrap());
-    assert!(persisted_active_file_name == br.state.active_file.path);
+    assert!(
+      persisted_active_file_name == br.state.active_file.read().unwrap().path
+    );
     assert!(
       data_files.len() == expected_num_data_files,
       format!(
@@ -1405,9 +1571,12 @@ mod tests {
       merge_config: MergeConfig::default(),
     };
     let br = BitRust::open(cfg, MockClock::new()).unwrap();
-    assert!(br.state.active_file.path == data_dir.as_ref().join("0.data"));
-    assert!(br.state.keydir.entries.len() == 0);
-    assert!(br.state.inactive_files.len() == 0);
+    assert!(
+      br.state.active_file.read().unwrap().path
+        == data_dir.as_ref().join("0.data")
+    );
+    assert!(br.state.keydir.read().unwrap().entries.len() == 0);
+    assert!(br.state.inactive_files.read().unwrap().len() == 0);
   }
 
   #[test]
@@ -1420,7 +1589,7 @@ mod tests {
       file_size_soft_limit_bytes: sz_limit,
       merge_config: MergeConfig::default(),
     };
-    let mut br = BitRust::open(cfg, MockClock::new()).unwrap();
+    let br = BitRust::open(cfg.clone(), MockClock::new()).unwrap();
     let mut clock = MockClock::new();
     clock.set_next(42);
     let mut proto_record = bitrust_pb::BitRustDataRecord::new();
@@ -1447,7 +1616,10 @@ mod tests {
       )
       .unwrap();
     }
-    let files_to_merge = br.state.get_files_for_merging();
+    let files_to_merge = get_files_for_merging(
+      &br.state.inactive_files.read().expect("inactive_files"),
+      &cfg,
+    );
     assert!(
       files_to_merge.len() == num_merge_files_expected,
       "Total files created={}, merge files expected={}, merge files actual={},\
@@ -1461,9 +1633,9 @@ mod tests {
     );
     for fid in files_to_merge {
       assert!(
-        fid.0 != br.state.active_file.id,
+        fid.0 != br.state.active_file_id(),
         "Merge file coverage includes active file id {}",
-        br.state.active_file.id
+        br.state.active_file_id()
       );
     }
   }
@@ -1480,7 +1652,7 @@ mod tests {
       file_size_soft_limit_bytes: sz_limit,
       merge_config: MergeConfig::default(),
     };
-    let mut br = BitRust::open(cfg, MockClock::new()).unwrap();
+    let br = BitRust::open(cfg, MockClock::new()).unwrap();
     let key_vals = (0..1000)
       .map(|_| {
         (
@@ -1506,7 +1678,7 @@ mod tests {
       file_size_soft_limit_bytes: DEFAULT_FILE_SIZE_SOFT_LIMIT_BYTES,
       merge_config: MergeConfig::default(),
     };
-    let mut br = BitRustState::new(cfg, MockClock::new()).unwrap();
+    let br = BitRustState::new(cfg, MockClock::new()).unwrap();
     br.put(b"foo".to_vec(), b"bar".to_vec()).unwrap();
     let r = br.get(b"foo").unwrap().unwrap();
     assert!(r == b"bar");
@@ -1535,7 +1707,7 @@ mod tests {
       file_size_soft_limit_bytes: DEFAULT_FILE_SIZE_SOFT_LIMIT_BYTES,
       merge_config: MergeConfig::default(),
     };
-    let mut br = BitRustState::new(cfg, MockClock::new()).unwrap();
+    let br = BitRustState::new(cfg, MockClock::new()).unwrap();
     br.put(b"foo".to_vec(), b"bar".to_vec()).unwrap();
     assert!(br.get(b"foo").unwrap().unwrap() == b"bar");
     br.delete(b"foo").unwrap();
@@ -1551,7 +1723,7 @@ mod tests {
       file_size_soft_limit_bytes: DEFAULT_FILE_SIZE_SOFT_LIMIT_BYTES,
       merge_config: MergeConfig::default(),
     };
-    let mut br = BitRust::open(cfg, MockClock::new()).unwrap();
+    let br = BitRust::open(cfg, MockClock::new()).unwrap();
     let key = util::rand_str_with_rand_size().as_bytes().to_vec();
     let val = util::rand_str_with_rand_size().as_bytes().to_vec();
     b.iter(move || {

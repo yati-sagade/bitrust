@@ -4,13 +4,15 @@ extern crate tempfile;
 #[macro_use]
 extern crate log;
 
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
 use bitrust::config::{
-  Config, MergeConfig, DEFAULT_FILE_SIZE_SOFT_LIMIT_BYTES,
+  AutoMergeConfig, Config, MergeConfig, DEFAULT_FILE_SIZE_SOFT_LIMIT_BYTES,
 };
 use bitrust::test_utils::{dump_all_datafiles, setup_logging};
 use bitrust::util::{rand_str_with_rand_size, SerialLogicalClock};
 use bitrust::{BitRust, BitRustState};
-use std::collections::HashMap;
 
 #[test]
 fn test_model_based_load_store() {
@@ -21,7 +23,7 @@ fn test_model_based_load_store() {
     merge_config: MergeConfig::default(),
     file_size_soft_limit_bytes: DEFAULT_FILE_SIZE_SOFT_LIMIT_BYTES,
   };
-  let mut br = BitRustState::new(cfg, SerialLogicalClock::new(0)).unwrap();
+  let br = BitRustState::new(cfg, SerialLogicalClock::new(0)).unwrap();
   let mut model = HashMap::new();
 
   for _ in 0..1000 {
@@ -53,7 +55,7 @@ fn test_model_based_load_store_with_restarts() {
         merge_config: MergeConfig::default(),
         file_size_soft_limit_bytes: 1000,
       };
-      let mut br = BitRust::open(cfg, SerialLogicalClock::new(0)).unwrap();
+      let br = BitRust::open(cfg, SerialLogicalClock::new(0)).unwrap();
       debug!("Generation {}: Putting keys", i);
       for key in &keys {
         let val = format!("{}_{}", key, i);
@@ -68,7 +70,7 @@ fn test_model_based_load_store_with_restarts() {
       merge_config: MergeConfig::default(),
       file_size_soft_limit_bytes: 1000,
     };
-    let mut br = BitRust::open(cfg, SerialLogicalClock::new(0)).unwrap();
+    let br = BitRust::open(cfg, SerialLogicalClock::new(0)).unwrap();
     debug!(">>>>>");
     dump_all_datafiles(&br.state).expect("Dump state");
     debug!("<<<<<");
@@ -95,7 +97,7 @@ fn test_model_based_load_store_with_restarts_and_merges() {
   let data_dir = tempfile::tempdir().unwrap();
   let mut expected_values = HashMap::<String, String>::new();
   {
-    let mut br = BitRust::open(
+    let br = BitRust::open(
       Config {
         datadir: data_dir.as_ref().to_path_buf(),
         merge_config: MergeConfig::default(),
@@ -128,7 +130,7 @@ fn test_model_based_load_store_with_restarts_and_merges() {
     expected_values.insert("bar".to_string(), format!("bar_{}", i - 1));
   }
   debug!("Reopening for reading");
-  let mut br = BitRust::open(
+  let br = BitRust::open(
     Config {
       datadir: data_dir.as_ref().to_path_buf(),
       merge_config: MergeConfig::default(),
@@ -161,5 +163,58 @@ fn test_model_based_load_store_with_restarts_and_merges() {
     br.state.active_file_id() == 2,
     "Expected file id 2 to be the active file, but active file id is {}",
     br.state.active_file_id()
+  );
+}
+
+#[test]
+fn test_model_based_load_store_with_auto_merge() {
+  setup_logging();
+  let data_dir = tempfile::tempdir().unwrap();
+  let br = BitRust::open(
+    Config {
+      datadir: data_dir.as_ref().to_path_buf(),
+      merge_config: MergeConfig {
+        require_hint_file_write_success: true,
+        auto_merge_config: Some(AutoMergeConfig {
+          check_interval_secs: 1,
+          min_inactive_files: 1,
+        }),
+      },
+      // We write records of the form foo => foo_[0-9], which makes the entry
+      // size 30 bytes. This option makes the active file rotate after each
+      // put.
+      file_size_soft_limit_bytes: 10000,
+    },
+    SerialLogicalClock::new(0),
+  )
+  .expect("Bitrust open");
+  let mut i = 0;
+  let start = Instant::now();
+  let keystr = "bar";
+  let key = keystr.as_bytes().to_vec();
+  while Instant::now() - start <= Duration::from_secs(3) {
+    let val = format!("bar_{}", i).as_bytes().to_vec();
+    br.put(key.clone(), val.clone())
+      .expect(&format!("put foo => bar_{}", i));
+    assert_eq!(
+      br.get(&key)
+        .expect(&format!("get {}", &keystr))
+        .expect(&format!("key {} should exist", &keystr)),
+      &val[..],
+    );
+    i += 1;
+  }
+  debug!(
+    "Total {} records written. Current active file is {}.",
+    i * 2,
+    br.state.active_file_id(),
+  );
+  br.put(key.clone(), b"_".to_vec())
+    .expect(&format!("last put to {}", &keystr));
+  assert_eq!(
+    br.get(&key)
+      .expect(&format!("get {}", &keystr))
+      .expect(&format!("key {} should exist", &keystr)),
+    b"_".to_vec(),
   );
 }

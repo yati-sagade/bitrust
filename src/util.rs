@@ -22,7 +22,11 @@ where
   P: AsRef<Path>,
   S: AsRef<str>,
 {
-  let mut file = OpenOptions::new().create(true).write(true).open(path)?;
+  let mut file = OpenOptions::new()
+    .create(true)
+    .write(true)
+    .truncate(true)
+    .open(path)?;
   let buf = buf.as_ref().bytes().collect::<Vec<_>>();
   file.write_all(&buf[..])
 }

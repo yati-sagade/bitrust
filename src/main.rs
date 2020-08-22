@@ -11,7 +11,7 @@ extern crate tempfile;
 use std::env;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process;
 
 use bitrust::config::{
@@ -34,6 +34,11 @@ fn main() -> Result<()> {
   }
 
   let config = build_config(&matches);
+  println!("Config {:?}", &config);
+  println!(
+    "{}",
+    toml::ser::to_string(&config).expect("config serialize")
+  );
   let datadir = config.datadir.to_path_buf();
 
   setup_logging(&datadir, log_level_filter(&matches))?;
@@ -41,23 +46,23 @@ fn main() -> Result<()> {
   let mut br = BitRust::open(config, util::SerialLogicalClock::new(0))
     .chain_err(|| format!("Failed to open bitrust at {:?}", &datadir))?;
 
-  cmd_loop(&mut br)
+  let ret = cmd_loop(&mut br);
+  ret
 }
 
 fn build_config(matches: &getopts::Matches) -> Config {
-  let data_dir = datadir(&matches);
-  let mut config = Config {
-    datadir: data_dir,
-    file_size_soft_limit_bytes: DEFAULT_FILE_SIZE_SOFT_LIMIT_BYTES,
-    merge_config: MergeConfig::default(),
-  };
-  if let Some(sz) = matches.opt_str("s") {
-    let max_file_fize_bytes = sz.parse::<i64>().unwrap_or_else(|e| {
-      panic!("Invalid value {} for -s: {:?}", sz, e);
-    });
-    config.file_size_soft_limit_bytes = max_file_fize_bytes;
+  if let Some(path) = matches.opt_str("c") {
+    let config_str = std::fs::read_to_string(path).expect("Read config file");
+    toml::from_str(&config_str).expect("Parse configuration")
+  } else {
+    Config {
+      datadir: dirs::home_dir()
+        .expect("Could not resolve $HOME, please provide -d")
+        .join("bitrust_data"),
+      file_size_soft_limit_bytes: DEFAULT_FILE_SIZE_SOFT_LIMIT_BYTES,
+      merge_config: MergeConfig::default(),
+    }
   }
-  config
 }
 
 fn prompt() -> Result<()> {
@@ -80,7 +85,7 @@ fn get_usage(
   None
 }
 
-fn cmd_loop<ClockT: util::LogicalClock>(
+fn cmd_loop<ClockT: util::LogicalClock + Send + Sync + 'static>(
   br: &mut BitRust<ClockT>,
 ) -> Result<()> {
   ctrlc::set_handler(move || {
@@ -213,17 +218,6 @@ fn log_level_filter(matches: &getopts::Matches) -> LevelFilter {
   }
 }
 
-fn datadir(matches: &getopts::Matches) -> PathBuf {
-  matches
-    .opt_str("d")
-    .map(Into::into) // convert to PathBuf
-    .unwrap_or_else(|| {
-      dirs::home_dir()
-        .expect("Could not resolve $HOME, please provide -d")
-        .join("bitrust_data")
-    })
-}
-
 fn setup_logging<P: AsRef<Path>>(
   datadir: P,
   level_filter: LevelFilter,
@@ -247,19 +241,13 @@ fn setup_logging<P: AsRef<Path>>(
 fn parse_opts(args: &[String]) -> (getopts::Matches, getopts::Options) {
   let mut opts = getopts::Options::new();
   opts.optflag("h", "help", "Print this help message and quit");
+  opts.optopt("c", "configfile", "Path to config file", "CONFIG_FILE");
   opts.optopt("l", "loglevel", "Log level", "LEVEL");
-  opts.optopt("d", "datadir", "Data directory", "DATADIR");
   opts.optopt(
     "b",
     "bench",
     "Print benchmark stats for an operation and exit",
     "KIND",
-  );
-  opts.optopt(
-    "s",
-    "max_file_size",
-    "Max data file size in bytes",
-    "MAX_FILE_SIZE",
   );
   let matches = opts.parse(args).expect("Error parsing options");
   (matches, opts)
