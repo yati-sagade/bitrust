@@ -457,7 +457,6 @@ fn maybe_rotate_output<T: Message>(
   // be active.
   if is_recordio_overlimit(rw, config)? {
     debug!("Active file is too big, sealing");
-    //self.inactive_files.insert(inactive_file.id, inactive_file);
     rotate_output(rw, file_id_gen.take_next(), config).map(|f| Some(f))
   } else {
     Ok(None)
@@ -695,6 +694,34 @@ fn write_hint_record(
   hint_file_writer.append_record(&hint).map(|_| ())
 }
 
+fn handle_merge_output_overflow(
+  file_id_gen: Arc<Mutex<util::FileIDGen>>,
+  inactive_files: Arc<RwLock<HashMap<FileID, InactiveFile>>>,
+  config: &Config,
+  merge_output_file: &mut ActiveFile,
+  hint_file_writer: &mut HintFileWriter,
+) -> Result<()> {
+  let old_merge_output = {
+    let mut idgen = file_id_gen
+      .lock()
+      .expect("Lock on file_id_gen to rotate mergefile");
+    maybe_rotate_output(merge_output_file, config, &mut idgen)?
+  };
+  if let Some(inactive_file) = old_merge_output {
+    let mut inactive_files = inactive_files
+      .write()
+      .expect("write lock on inactive_files for merge file rotation");
+    inactive_files.insert(inactive_file.id, inactive_file);
+    inactive_files.insert(
+      merge_output_file.id,
+      InactiveFile::new(merge_output_file.path.clone())
+        .chain_err(|| "Creating an InactiveFile for the new merge file")?,
+    );
+    rotate_output(hint_file_writer, merge_output_file.id, config)?;
+  }
+  Ok(())
+}
+
 fn merge_one_file(
   keydir: Arc<RwLock<KeyDir>>,
   mut data_file: InactiveFile,
@@ -710,37 +737,20 @@ fn merge_one_file(
     &data_file.path, all_merge_file_ids
   );
   'record_loop: while let Some(record) = data_file.next_record()? {
-    if is_recordio_overlimit(merge_output_file, config)? {
-      {
-        // chan: get next file id
-        // perform rotation
-        // chan: add new mergefile to inactive files
-        let new_file_id = file_id_gen
-          .lock()
-          .expect("Lock on file_id_gen to rotate mergefile")
-          .take_next(); // chan
-        let mut inactive_files = inactive_files
-          .write()
-          .expect("write lock on inactive_files for merge file rotation");
-        rotate_output(merge_output_file, new_file_id, config)
-          .map(|f| inactive_files.insert(f.id, f))?; // chan
-        all_merge_file_ids.insert(merge_output_file.id);
-        rotate_output(hint_file_writer, merge_output_file.id, config)?;
-        // Also need to add the new active file as an inactive file to
-        // the keydir so reads can be served.
-        let merge_inactive_file =
-          InactiveFile::new(merge_output_file.path.clone())
-            .chain_err(|| "Creating an InactiveFile for the new merge file")?;
-        inactive_files.insert(merge_inactive_file.id, merge_inactive_file); // chan
-      }
-    }
+    handle_merge_output_overflow(
+      file_id_gen.clone(),
+      inactive_files.clone(),
+      config,
+      merge_output_file,
+      hint_file_writer,
+    )?;
+
     let mut keydir = keydir
       .write()
       .expect("write lock on keydir to write merge record");
-    // Name of the file that the keydir points to for this key.
+
     if let Some(curr_ts) =
       keydir.get(record.get_key()).map(|entry| entry.timestamp)
-    // chan
     {
       if curr_ts > record.get_timestamp() {
         // We have a newer record in the keydir.
