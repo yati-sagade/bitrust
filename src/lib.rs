@@ -94,20 +94,17 @@ fn setup_bitrust(config: &Config) -> Result<PathBuf> {
   let first_active_file =
     util::FileKind::DataFile.path_from_id(0, &config.datadir);
   debug!("First active file name {:?}", &first_active_file);
-  debug!("To str: {:?}", first_active_file.to_str().unwrap());
+  debug!("To str: {:?}", first_active_file);
   util::write_to_file(
     &ptr_path,
-    first_active_file
-      .to_str()
-      .expect("Garbled initial data file name"),
-  )
-  .chain_err(|| {
-    format!(
-      "Failed to write active file name to the\
+    first_active_file.to_str().chain_err(|| {
+      format!(
+        "Failed to write active file name to the\
            pointer file {:?}",
-      &ptr_path
-    )
-  })?;
+        &ptr_path
+      )
+    })?,
+  )?;
   Ok(first_active_file)
 }
 
@@ -288,20 +285,20 @@ where
   }
 
   pub fn put(&self, key: Vec<u8>, val: Vec<u8>) -> Result<()> {
-    let mut clock = self.clock.lock().expect("Lock on clock for put");
-    let mut keydir = self.keydir.write().expect("Write lock on keydir for put");
-    let mut active_file = self
-      .active_file
-      .write()
-      .expect("Write lock on active_file for put");
+    // Locks can be poisoned if a thread fails while holding them.
+    // We just crash when this happens.
+    let mut clock = self.clock.lock().expect("Lock clock for put");
+    let mut keydir = self.keydir.write().expect("WLock keydir for put");
+    let mut active_file =
+      self.active_file.write().expect("WLock active_file for put");
     let mut inactive_files = self
       .inactive_files
       .write()
-      .expect("Write lock on inactive_files for put");
+      .expect("WLock inactive_files for put");
     let mut file_id_gen = self
       .data_file_id_gen
       .lock()
-      .expect("Write lock on fileidgen for put");
+      .expect("WLock data_file_id_gen for put");
 
     let timestamp_now = clock.tick();
     let mut record = bitrust_pb::BitRustDataRecord::new();
@@ -350,6 +347,8 @@ where
   }
 
   pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    // Locks can be poisoned if a thread fails while holding them.
+    // We just crash when this happens.
     let keydir = self.keydir.read().expect("rlock on keydir for get");
     let mut active_file = self
       .active_file
@@ -359,9 +358,8 @@ where
       .inactive_files
       .write()
       .expect("rlock on inactive_files for read");
-    let entry = keydir.get(key);
 
-    if let Some(entry) = entry {
+    if let Some(entry) = keydir.get(key) {
       let record: bitrust_pb::BitRustDataRecord =
         if entry.file_id == active_file.id {
           debug!(
@@ -398,7 +396,6 @@ where
               )
             })?
         };
-
       // Currently deletion and the application writing the tombstone
       // value directly are indistinguishable.
       if record.get_value() == BITRUST_TOMBSTONE_STR {
@@ -434,15 +431,17 @@ fn update_active_file_id(id: FileID, config: &Config) -> Result<PathBuf> {
   let new_active_file_path =
     util::FileKind::DataFile.path_from_id(id, &config.datadir);
   let ptr_path = active_file_pointer_path(&config.datadir);
-
   util::write_to_file(
     &ptr_path,
-    new_active_file_path
-      .to_str()
-      .expect("Garbled data file name"),
+    new_active_file_path.to_str().chain_err(|| {
+      format!(
+        "update_active_file_id: Failed to serialize active \
+        file pathbuf {:?} to str",
+        &new_active_file_path
+      )
+    })?,
   )
   .chain_err(|| "Failed to update active file name in the pointer file")?;
-
   Ok(new_active_file_path)
 }
 
@@ -710,7 +709,7 @@ fn handle_merge_output_overflow(
   if let Some(inactive_file) = old_merge_output {
     let mut inactive_files = inactive_files
       .write()
-      .expect("write lock on inactive_files for merge file rotation");
+      .expect("WLock on inactive_files for merge file rotation");
     inactive_files.insert(inactive_file.id, inactive_file);
     inactive_files.insert(
       merge_output_file.id,
@@ -747,7 +746,7 @@ fn merge_one_file(
 
     let mut keydir = keydir
       .write()
-      .expect("write lock on keydir to write merge record");
+      .expect("WLock on keydir to write merge record");
 
     if let Some(curr_ts) =
       keydir.get(record.get_key()).map(|entry| entry.timestamp)
@@ -898,8 +897,7 @@ fn merge(
     let files_to_merge = {
       let inactive_files = inactive_files
         .read()
-        //.map_err(|e| ErrorKind::LockPoisoned(format!("{}", e)).into())?;
-        .expect("get inactive files for merge");
+        .expect("RLock on inactive_files for getting files to merge");
       get_files_for_merging(&inactive_files, &config)
     };
     debug!("Going to merge these files: {:?}", &files_to_merge);
@@ -937,10 +935,7 @@ fn merge(
     let merge_output_file_id = {
       idgen
         .lock()
-        //.map_err(|e| {
-        //  ErrorKind::LockPoisoned(format!("idgen for merge {}", e)).into()
-        //})?
-        .expect("idgen for merge")
+        .expect("Lock idgen to generate merge output file id")
         .take_next()
     };
     let merge_output_file_name =
@@ -957,14 +952,7 @@ fn merge(
 
     inactive_files
       .write()
-      //.map_err(|e| {
-      //  ErrorKind::LockPoisoned(format!(
-      //    "writing inactive_files for merge {}",
-      //    e
-      //  ))
-      //  .into()
-      //})?
-      .expect("inactive files for merge")
+      .expect("WLock inactive_files to insert merge output file")
       .insert(merge_inactive_file.id, merge_inactive_file);
     merge_active_file
   };
@@ -1008,17 +996,9 @@ fn merge(
         warn!("Error removing hint file {:?}: {:?}", &hint_file_path, e);
       }
     }
-
     inactive_files
       .write()
-      //.map_err(|e| {
-      //  ErrorKind::LockPoisoned(format!(
-      //    "writing inactive_files for merge {}",
-      //    e
-      //  ))
-      //  .into()
-      //})?
-      .expect("inactive files for merge")
+      .expect("WLock inactive_files for removing merged file")
       .remove(&data_file_id);
   }
   Ok(())
