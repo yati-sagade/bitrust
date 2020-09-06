@@ -1,10 +1,15 @@
-use std::io::{BufRead, Read, Seek, SeekFrom, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::marker::PhantomData;
+use std::path::PathBuf;
 
 use byteorder::{BigEndian, ReadBytesExt};
 use bytes::{BufMut, BytesMut};
 use errors::*;
 use protobuf::Message;
 use util;
+
+use common::FileID;
 
 // Offsets of recordio items in a payload.
 // The offset of the data checksum is dependent on data size, so is not declared
@@ -238,6 +243,115 @@ pub mod test_utils {
     fn writer<'a>(&'a mut self) -> Result<&'a mut Cursor<Vec<u8>>> {
       Ok(&mut self.cursor)
     }
+  }
+}
+
+// struct ActiveFile is just a collection of things related to the active file
+// -- the current log of writes. We hold two file handles to this file, one for
+// writing, which happens only by appending, and one handle for reading, which
+// we can seek freely.
+#[derive(Debug)]
+pub struct FileBasedRecordReader<T> {
+  reader: BufReader<File>,
+  pub path: PathBuf,
+  pub id: FileID,
+  phantom: PhantomData<T>,
+}
+
+impl<T: Message> FileBasedRecordReader<T> {
+  pub fn new(path: PathBuf) -> io::Result<FileBasedRecordReader<T>> {
+    let f = FileBasedRecordReader::<T> {
+      reader: BufReader::new(
+        OpenOptions::new().read(true).create(false).open(&path)?,
+      ),
+      id: util::file_id_from_path(&path),
+      path: path,
+      phantom: PhantomData,
+    };
+    Ok(f)
+  }
+}
+
+#[derive(Debug)]
+pub struct FileBasedRecordRW<T> {
+  writer: File,
+  reader: BufReader<File>,
+  pub path: PathBuf,
+  pub id: FileID,
+  pub w_offset: u64,
+  phantom: std::marker::PhantomData<T>,
+}
+
+impl<T: Message> FileBasedRecordRW<T> {
+  pub fn new(path: PathBuf) -> io::Result<FileBasedRecordRW<T>> {
+    let mut writer = OpenOptions::new()
+      .read(true)
+      .write(true)
+      .create(true)
+      .open(&path)?;
+    let w_offset = writer.seek(SeekFrom::End(0))?;
+    let f = FileBasedRecordRW::<T> {
+      writer,
+      reader: BufReader::new(
+        OpenOptions::new().read(true).create(false).open(&path)?,
+      ),
+      id: util::file_id_from_path(&path),
+      path: path,
+      phantom: PhantomData,
+      w_offset: w_offset,
+    };
+    debug!("Initialized active file");
+    Ok(f)
+  }
+
+  pub fn append_record(&mut self, record: &T) -> AppendRecordResult {
+    let (offset, payload_len) = RecordAppend::append_record(self, record)?;
+    self.w_offset += payload_len;
+    Ok((offset, payload_len))
+  }
+
+  pub fn retreat(&mut self, bytes_to_retreat: u64) -> Result<u64> {
+    self.w_offset = RecordAppend::retreat(self, bytes_to_retreat)?;
+    Ok(self.w_offset)
+  }
+}
+
+impl<T> Into<FileBasedRecordReader<T>> for FileBasedRecordRW<T> {
+  fn into(self) -> FileBasedRecordReader<T> {
+    FileBasedRecordReader {
+      reader: self.reader,
+      path: self.path,
+      id: self.id,
+      phantom: self.phantom,
+    }
+  }
+}
+
+impl<T: Message> RecordRead for FileBasedRecordReader<T> {
+  type Message = T;
+  type Reader = BufReader<File>;
+  fn reader<'a>(&'a mut self) -> Result<&'a mut BufReader<File>> {
+    Ok(&mut self.reader)
+  }
+}
+
+impl<T: Message> RecordRead for FileBasedRecordRW<T> {
+  type Message = T;
+  type Reader = BufReader<File>;
+  fn reader<'a>(&'a mut self) -> Result<&'a mut BufReader<File>> {
+    Ok(&mut self.reader)
+  }
+}
+
+impl<T: Message> RecordAppend for FileBasedRecordRW<T> {
+  type Message = T;
+  type Writer = File;
+  fn writer<'a>(&'a mut self) -> Result<&'a mut File> {
+    Ok(&mut self.writer)
+  }
+
+  fn tell(&mut self) -> Result<u64> {
+    Ok(self.w_offset)
   }
 }
 
