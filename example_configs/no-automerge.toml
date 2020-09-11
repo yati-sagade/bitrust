@@ -1,0 +1,9 @@
+# This is a minimal config, with automerging not configured. This
+# means merges will be done only when requested, either via the
+# BitRust::merge(), or with the _merge command on the CLI.
+
+# This is where the datafiles and other state is kept.
+datadir = "/tmp/bitrust_data"
+
+# Limit file size to 10MiB.
+file_size_soft_limit_bytes = 10485760

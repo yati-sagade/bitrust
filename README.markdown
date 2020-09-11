@@ -1,14 +1,14 @@
 # Bitrust
 
- This is a Rust implmentation of Bitcask: http://basho.com/wp-content/uploads/2015/05/bitcask-intro.pdf
-
- ** This project is under development. Please do not use it seriously **
-
-## Running
+ This is a Rust implmentation of [Bitcask](http://basho.com/wp-content/uploads/2015/05/bitcask-intro.pdf), a persistent key-value store for
+ when the keyspace fits in memory. This is not a distributed datastore, but
+ can be used as a building block for one.
+ 
+ ## Running
 
 ```shell
-$ mkdir /tmp/datadir
-$ cargo run -- --datadir /tmp/datadir --loglevel debug
+$ mkdir /tmp/bitrust_data
+$ cargo run -- --configfile ./example_configs/no-automerge.toml --loglevel debug
 > put foo bar
 > get foo
 Ok(Some("bar"))
@@ -22,7 +22,14 @@ baz
 > get baz
 Ok(Some("egg"))
 > quit 
-$ less /tmp/datadir/bitrust.log
+$ less /tmp/bitrust_data/bitrust.log
+```
+
+You can view the logs in a separate window by tailing `bitrust.log` in the
+datadir.
+
+```
+$ tail -f /tmp/bitrust_data/bitrust.log
 ```
 
 ## Data directory contents

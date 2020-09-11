@@ -1,0 +1,19 @@
+# This is where the datafiles and other state is kept.
+datadir = "/tmp/bitrust_data"
+
+# Limit file size to 10MiB.
+file_size_soft_limit_bytes = 10485760
+
+[merge_config]
+
+# Hintfiles expedite startup, but are not essential for correctness.
+# Setting this flag to true will fail merges if hint file writes fail.
+require_hint_file_write_success = true
+
+[merge_config.auto_merge_config]
+
+# Merge only if at least 20 inactive files are available for merging.
+min_inactive_files = 20
+
+# Attempt merging every 15 mins.
+check_interval_secs = 900
