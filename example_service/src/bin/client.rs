@@ -19,7 +19,6 @@ fn put(
   let mut req = PutRequest::new();
   req.set_key(key);
   req.set_value(val);
-  println!("Sending put {:?}", &req);
   let fut = client
     .put(grpc::RequestOptions::new(), req)
     .join_metadata_result();
@@ -30,7 +29,6 @@ fn put(
 fn get(client: &mut BitRustServiceClient, key: Vec<u8>) -> GetResponse {
   let mut req = GetRequest::new();
   req.set_key(key);
-  println!("Sending get {:?}", &req);
   let fut = client
     .get(grpc::RequestOptions::new(), req)
     .join_metadata_result();
