@@ -19,7 +19,7 @@ extern crate simplelog;
 #[macro_use]
 extern crate error_chain;
 
-mod bitrust_pb;
+pub mod bitrust_pb;
 mod common;
 pub mod config;
 pub mod errors;

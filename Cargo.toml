@@ -35,3 +35,4 @@ criterion = "0.3"
 [[bench]]
 name = "bitrust_bench"
 harness = false
+path = "benches/bitrust_bench.rs"
