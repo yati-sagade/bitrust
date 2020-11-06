@@ -163,8 +163,31 @@ pub trait RecordRead {
 // CRCs).
 pub type AppendRecordResult = Result<(u64, u64)>;
 
+pub trait SyncWrite: Write {
+  fn sync(&mut self) -> std::io::Result<()>;
+  fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    println!("SyncWrite::write");
+    let n = Write::write(self, buf)?;
+    self.sync()?;
+    Ok(n)
+  }
+
+  fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+    Write::write_all(self, buf)?;
+    Write::flush(self)?;
+    self.sync()?;
+    Ok(())
+  }
+}
+
+impl SyncWrite for File {
+  fn sync(&mut self) -> std::io::Result<()> {
+    File::sync_data(self)
+  }
+}
+
 pub trait RecordAppend {
-  type Writer: Write + Seek;
+  type Writer: SyncWrite + Seek;
   type Message: protobuf::Message;
 
   fn writer<'a>(&'a mut self) -> Result<&'a mut Self::Writer>;
@@ -195,11 +218,8 @@ pub trait RecordAppend {
     let record_crc = util::checksum_crc32(&record_data);
     payload.put(record_data);
     payload.put_u32_be(record_crc);
-    self
-      .writer()?
-      .write_all(&payload)
-      .map_err(|e| e.into())
-      .map(|_| (offset, payload.len() as u64))
+    SyncWrite::write_all(self.writer()?, &payload)?;
+    Ok((offset, payload.len() as u64))
   }
 
   /// Retreats the writer `bytes_to_retreat` bytes back. This is useful for
@@ -218,6 +238,12 @@ pub mod test_utils {
   use super::*;
   use bitrust_pb::BitRustDataRecord;
   use std::io::Cursor;
+  impl SyncWrite for Cursor<Vec<u8>> {
+    fn sync(&mut self) -> std::io::Result<()> {
+      Write::flush(self)?;
+      Ok(())
+    }
+  }
 
   pub struct CursorBasedReader<T> {
     pub cursor: Cursor<T>,
