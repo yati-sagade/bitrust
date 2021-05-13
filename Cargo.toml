@@ -12,6 +12,7 @@ categories = ["database-implementations"]
 
 [build-dependencies]
 protoc-rust = "2.8.0"
+glob = "0.3.0"
 
 [dependencies]
 crc = "1.8.1"
