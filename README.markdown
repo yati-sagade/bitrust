@@ -1,8 +1,10 @@
 # Bitrust
 
- This is a Rust implmentation of [Bitcask](http://basho.com/wp-content/uploads/2015/05/bitcask-intro.pdf), a persistent key-value store for
+ This is a Rust implementation of [Bitcask](http://basho.com/wp-content/uploads/2015/05/bitcask-intro.pdf), a persistent key-value store for
  when the keyspace fits in memory. This is not a distributed datastore, but
  can be used as a building block for one.
+ 
+ This crate hasn't been stress-tested. While it should be good enough for experimentation, we make no guarantees around data durability.
  
  ## Running
 
