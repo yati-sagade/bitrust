@@ -2,6 +2,13 @@
 name = "bitrust"
 version = "0.1.0"
 authors = ["Yati Sagade <mail@ysagade.nl>"]
+license-file = "LICENSE"
+description = "A Rust implementation of Bitcask, usable as a binary or a library."
+readme = "README.markdown"
+homepage = "https://github.com/yati-sagade/bitrust"
+repository ="https://github.com/yati-sagade/bitrust" 
+keywords = ["key value store", "database"]
+categories = ["database-implementations"]
 
 [build-dependencies]
 protoc-rust = "2.8.0"
