@@ -7,7 +7,7 @@ description = "A Rust implementation of Bitcask, usable as a binary or a library
 readme = "README.markdown"
 homepage = "https://github.com/yati-sagade/bitrust"
 repository ="https://github.com/yati-sagade/bitrust" 
-keywords = ["key value store", "database"]
+keywords = ["key-value-store", "database"]
 categories = ["database-implementations"]
 
 [build-dependencies]
